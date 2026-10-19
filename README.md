@@ -20,8 +20,174 @@
 
 You can configure MCP clients either manually (JSON/TOML) or via the configurator CLI (`@mcp-abap-adt/configurator`, repo: [`mcp-abap-adt-conf`](https://github.com/fr0ster/mcp-abap-adt-conf)).
 
+## SAP BTP Cloud Foundry Deployment
+
+This repository can be deployed to **SAP BTP Cloud Foundry** as a **remote MCP server** (streamable HTTP). It reaches an **on-premise S/4HANA** system through **BTP destinations**, the **Connectivity service** and the **SAP Cloud Connector**. MCP clients connect over HTTPS with an XSUAA token, and nothing in the corporate network is exposed to the internet.
+
+```
+MCP client ──HTTPS + XSUAA bearer token──▶ CF app "abap-mcp-server" (btp/)
+                                              │
+                                              ├─▶ Destination service ── reads "S4H_ADT" (URL, user, sap-client)
+                                              └─▶ Connectivity proxy ──▶ Cloud Connector ──▶ S/4HANA ICM (/sap/bc/adt)
+```
+
+### What was changed to make it BTP-ready
+
+| Change | File(s) | Purpose |
+|---|---|---|
+| MTA descriptor | `mta.yaml` | Defines the Node.js app `abap-mcp-server` and three service instances: `abap-mcp-xsuaa` (xsuaa/application), `abap-mcp-destination` (destination/lite), `abap-mcp-connectivity` (connectivity/lite). Health check on `/mcp/health`. |
+| Security descriptor | `xs-security.json` | Scope `$XSAPPNAME.MCPUser`, role template `MCPUser`, role collection **`ABAP_MCP_User`**, `authorities` for client-credentials clients, and OAuth redirect URIs for MCP clients. |
+| CF entry point | `btp/src/index.ts` | Express app. It listens on `$PORT`, mounts the MCP endpoint at `/mcp`, and builds the tool list from `MCP_EXPOSITION`. |
+| XSUAA guard | `btp/src/xsuaaGuard.ts` | Every call to `/mcp` needs a valid XSUAA token with the `MCPUser` scope. Without one it answers `401` with `WWW-Authenticate: Bearer resource_metadata=…` (MCP OAuth discovery). It also serves `/.well-known/oauth-protected-resource/mcp` and strips the `x-sap-url` / `x-sap-login` / `x-sap-password` headers, so callers can only use destinations. |
+| BTP destinations | `btp/src/BtpDestinations.ts`, `btp/src/destinationService.ts` | Reads destinations from the BTP Destination service (cached for 5 min) and maps them to the server's connection settings (`URL`, `sap-client`). Supports an optional allowlist (`MCP_ALLOWED_DESTINATIONS`). |
+| Destination credential | `btp/src/BtpDestinationAuthProvider.ts` | Adds the right headers to each ADT request. **BasicAuthentication**: `Authorization: Basic`. **PrincipalPropagation**: the user token exchanged at the Connectivity service. **OAuth2 / SAML**: the token the Destination service issues. **On-premise**: `Proxy-Authorization` and `SAP-Connectivity-SCC-Location_ID`. |
+| OAuth helpers | `btp/src/oauth.ts`, `btp/src/vcap.ts`, `btp/src/requestUser.ts` | Fetch and cache client-credentials and JWT-bearer tokens, read `VCAP_SERVICES` / `VCAP_APPLICATION`, and keep the calling user per request. |
+| Proxy hook in the library | `src/lib/connectionFactory.ts`, `src/lib/utils.ts` | New `setHttpProxyResolver()`. It routes HTTP connections of on-premise destinations through the connectivity proxy, and does nothing unless set. The HTTP wire log now also redacts `Proxy-Authorization`. |
+| Build scripts | `btp/scripts/build.mjs`, `btp/scripts/mtar.mjs`, `package.json` | `build.mjs` compiles the lib and core server **from this checkout** and packs them into `btp/vendor/`, then compiles `btp/src`. `mtar.mjs` builds the `.mtar` without GNU make. New npm scripts: `btp:mtar`, `btp:deploy`. |
+| Docs | `docs/deployment/BTP_CLOUD_FOUNDRY.md` | Full deployment guide. |
+
+### Current deployment
+
+| Item | Value |
+|---|---|
+| Region / API | `ca10` — `https://api.cf.ca10.hana.ondemand.com` |
+| Org / Space | `olymel-devops` / `MCP` |
+| App | `abap-mcp-server` |
+| MCP endpoint | `https://olymel-devops-mcp-abap-mcp-server.cfapps.ca10.hana.ondemand.com/mcp` |
+| Health check | `https://olymel-devops-mcp-abap-mcp-server.cfapps.ca10.hana.ondemand.com/mcp/health` (no token needed) |
+| Default destination | `S4H_ADT` |
+| Service key for technical clients | `mcp-client` on `abap-mcp-xsuaa` |
+
+### Step 1: Cloud Connector (on-premise side)
+
+In the SAP Cloud Connector connected to the subaccount, open **Cloud To On-Premise → Access Control → Add**:
+
+| Field | Value |
+|---|---|
+| Back-end type | ABAP System |
+| Protocol | HTTPS (or HTTP) |
+| Internal host / port | S/4HANA ICM host and HTTPS port (e.g. `s4hhost.corp.local:44300`) |
+| Virtual host / port | e.g. `s4h-adt` / `44300` (this is what the destination URL uses) |
+| Principal type | `None` for Basic authentication, `X.509 Certificate` for principal propagation |
+
+Add these **resources** to the mapping, each with **Path and all sub-paths**:
+
+- `/sap/bc/adt/`
+- `/sap/public/bc/icf/logoff`
+
+Check that the connector shows **Connected** in the BTP cockpit (**Connectivity → Cloud Connectors**). If it uses a **Location ID**, note it for the destination.
+
+### Step 2: Create the `S4H_ADT` destination
+
+In the BTP cockpit, open **Subaccount → Connectivity → Destinations → New Destination** (or create it at space level):
+
+| Field | Value |
+|---|---|
+| Name | `S4H_ADT` |
+| Type | `HTTP` |
+| Description | S/4HANA ADT for the MCP server |
+| URL | `http://s4h-adt:44300` (the **virtual** host from the Cloud Connector; always `http://`, the Cloud Connector does TLS to the backend) |
+| Proxy Type | `OnPremise` |
+| Authentication | `BasicAuthentication` |
+| User / Password | SAP user with ADT authorizations (`S_ADT_RES`, `S_DEVELOP`, …) |
+| Location ID | only if the Cloud Connector uses one |
+
+**Additional properties** (*New Property*):
+
+| Property | Value | Meaning |
+|---|---|---|
+| `sap-client` | e.g. `100` | SAP client to log on to |
+| `mcp-system-type` | `onprem` (optional) | `onprem` (default) or `cloud` |
+
+**Principal propagation (optional):** set *Authentication* to `PrincipalPropagation` and the Cloud Connector principal type to *X.509 Certificate*. Then set up trust between the Cloud Connector and S/4HANA (system certificate, `CERTRULE`). Each MCP user is then logged on to SAP as themselves. This requires users to log in with the authorization-code flow; client-credentials tokens have no user.
+
+**More systems:** create more destinations (for example `S4H_ADT_QA`). A client selects one with the HTTP header `x-mcp-destination: <name>`. To restrict which names can be used, set `MCP_ALLOWED_DESTINATIONS`.
+
+The destination is read at runtime, so creating or changing it needs **no redeploy**.
+
+### Step 3: Build and deploy
+
+Prerequisites: Node 22+, the `cf` CLI with the `multiapps` plugin, and `mbt` (`npm i -g mbt`).
+
+```bash
+cf login -a https://api.cf.ca10.hana.ondemand.com     # org olymel-devops, space MCP
+npm ci                                                # once, at the repo root
+npm run btp:mtar      # → mta_archives/abap-mcp-server.mtar (works without GNU make)
+npm run btp:deploy    # cf deploy mta_archives/abap-mcp-server.mtar
+```
+
+### Step 4: Authorize users and clients
+
+- **Users:** assign the role collection **`ABAP_MCP_User`** in **Security → Users** (or map it to an IdP group).
+- **Technical clients:** get a token with client credentials:
+
+```bash
+cf service-key abap-mcp-xsuaa mcp-client            # clientid, clientsecret, url
+curl -s -u "<clientid>:<clientsecret>" "<url>/oauth/token" -d grant_type=client_credentials
+```
+
+The token is valid for 1 hour (`token-validity` in `xs-security.json`).
+
+### Step 5: Connect an MCP client
+
+Claude Code:
+
+```bash
+claude mcp add --transport http abap \
+  https://olymel-devops-mcp-abap-mcp-server.cfapps.ca10.hana.ondemand.com/mcp \
+  --header "Authorization: Bearer <token>" \
+  --header "x-mcp-destination: S4H_ADT"
+```
+
+Generic `mcp.json` (Cline, Cursor, VS Code):
+
+```json
+{
+  "mcpServers": {
+    "abap": {
+      "type": "streamableHttp",
+      "url": "https://olymel-devops-mcp-abap-mcp-server.cfapps.ca10.hana.ondemand.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>",
+        "x-mcp-destination": "S4H_ADT"
+      }
+    }
+  }
+}
+```
+
+`x-mcp-destination` can be omitted: `SAP_DESTINATION` (`S4H_ADT`) is then used.
+
+### Runtime settings (`mta.yaml` → `properties`)
+
+| Variable | Value | Meaning |
+|---|---|---|
+| `SAP_DESTINATION` | `S4H_ADT` | Default destination |
+| `MCP_ALLOW_DESTINATION_HEADER` | `true` | Allow `x-mcp-destination` to choose another destination |
+| `MCP_ALLOWED_DESTINATIONS` | *(empty = any)* | Comma-separated allowlist |
+| `MCP_EXPOSITION` | `readonly,high` | Tool groups: `readonly`, `high`, `low`, `debug` |
+| `SAP_SYSTEM_TYPE` | `onprem` | Default system type |
+| `MCP_PATH` / `MCP_SCOPE` | `/mcp` / `MCPUser` | Endpoint path and required scope |
+| `DEBUG_HTTP_WIRE` | *(unset)* | `true` logs every ADT request (credentials redacted) |
+
+Change a value with `cf set-env abap-mcp-server <VAR> <value>`, then `cf restage abap-mcp-server`; or edit `mta.yaml` and redeploy.
+
+### Troubleshooting
+
+Logs: `cf logs abap-mcp-server --recent`
+
+| Log / symptom | Cause |
+|---|---|
+| `BTP destination "S4H_ADT" was not found` | The destination isn't created yet, or its name differs |
+| Proxy `502`/`503`, connection refused | Cloud Connector not connected, wrong virtual host or port, Location ID mismatch, or `/sap/bc/adt/` not exposed |
+| `403` from SAP | The SAP user lacks ADT authorizations |
+| `401` from the app | Token missing or expired, or no `MCPUser` scope (assign `ABAP_MCP_User` or check the service key) |
+
+**Security notes:** with `BasicAuthentication`, every MCP user acts as the destination's SAP user. Grant that user only what the exposed tools need, or use principal propagation, and enable the `low` / `debug` tool groups deliberately. Full guide: [docs/deployment/BTP_CLOUD_FOUNDRY.md](docs/deployment/BTP_CLOUD_FOUNDRY.md).
+
 ## Table of Contents
 
+0. [SAP BTP Cloud Foundry Deployment](#sap-btp-cloud-foundry-deployment)
 1. [Getting Started](#getting-started)
 2. [Architecture](#architecture)
 3. [Quick Start](#quick-start)
