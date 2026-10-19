@@ -1,0 +1,157 @@
+/**
+ * Unified server configuration interface
+ * Shared by both v1 and v2 servers
+ */
+
+import type { TransportConfig } from '../utils.js';
+
+/** TLS configuration for HTTPS server */
+export interface TlsConfig {
+  /** Path to TLS certificate file (PEM) */
+  cert: string;
+  /** Path to TLS private key file (PEM) */
+  key: string;
+  /** Path to CA certificate file (PEM), optional */
+  ca?: string;
+}
+
+/** Transport type (simple string for v2) */
+export type Transport = 'stdio' | 'sse' | 'http';
+
+/** Handler set for exposition control */
+/**
+ * The handler sets a configuration may name.
+ *
+ * `compact` is still a member and is deliberately NOT served here: the facade is
+ * `@mcp-abap-adt/compact`, its own command. Keeping the value means a configuration
+ * that asks for it is recognised and refused with that pointer
+ * (`validateExposition`) rather than parsed as a typo or silently ignored.
+ */
+export type HandlerSet = 'readonly' | 'high' | 'low' | 'compact' | 'debug';
+
+export interface IServerConfig {
+  // ============================================================================
+  // COMMON FIELDS (used by both v1 and v2)
+  // ============================================================================
+
+  /** Path to .env file */
+  envFilePath?: string;
+  /** `--env` / `env` as the user gave it: a destination name or a path */
+  envDestination?: string;
+  /** `--env-path` / `MCP_ENV_PATH` / `env-path` as the user gave it */
+  envPath?: string;
+  /**
+   * The parameter `envFile` came from, as the user gave it: `--env`,
+   * `--env-path`, `MCP_ENV_PATH`, `env (config file)`,
+   * or `env-path (config file)`.
+   */
+  envFileSource?: string;
+  /** Alias for envFilePath (v2 compatibility) */
+  envFile?: string;
+  /** Custom path for auth broker storage */
+  authBrokerPath?: string;
+  /** Default MCP destination from --mcp parameter */
+  mcpDestination?: string;
+  /** Use unsafe mode (file-based session store) */
+  unsafe?: boolean;
+  /**
+   * Browser type for authentication (chrome, edge, firefox, system, headless, none)
+   * - 'system' (default): Opens system default browser
+   * - 'headless': Logs URL and waits for manual callback (SSH/remote sessions)
+   * - 'none': Logs URL and rejects immediately (automated tests)
+   */
+  browser?: string;
+  /** Port for browser auth callback server */
+  browserAuthPort?: number;
+  /** Allow x-mcp-destination header to override default destination (--allow-destination-header) */
+  allowDestinationHeader?: boolean;
+
+  // ============================================================================
+  // TRANSPORT CONFIGURATION
+  // ============================================================================
+
+  /** Transport type (simple string) */
+  transport?: Transport;
+  /** Full transport configuration (v1 style, complex object) */
+  transportConfig?: TransportConfig;
+  /** Server host */
+  host?: string;
+  /** Server port */
+  port?: number;
+  /** Allowed Host header values (DNS-rebinding protection; exact, incl. port) */
+  allowedHosts?: string[];
+  /** Allowed Origin header values (DNS-rebinding protection; exact, incl. scheme) */
+  allowedOrigins?: string[];
+  /** Enable DNS-rebinding protection (requires allowedHosts and/or allowedOrigins) */
+  enableDnsRebindingProtection?: boolean;
+
+  // ============================================================================
+  // HTTP/SSE SPECIFIC
+  // ============================================================================
+
+  /** Enable JSON response format for HTTP */
+  httpJsonResponse?: boolean;
+  /** HTTP endpoint path */
+  httpPath?: string;
+  /** SSE connection path */
+  ssePath?: string;
+  /** SSE message post path */
+  postPath?: string;
+  /** TLS configuration for HTTPS (cert + key enables HTTPS automatically) */
+  tls?: TlsConfig;
+
+  // ============================================================================
+  // HANDLER EXPOSITION (v2)
+  // ============================================================================
+
+  /** Handler sets to expose */
+  exposition?: HandlerSet[];
+
+  // ============================================================================
+  // CONFIG FILE
+  // ============================================================================
+
+  /** Path to YAML config file */
+  configFile?: string;
+
+  /** SAP connection type: http (default) or rfc */
+  connectionType?: 'http' | 'rfc';
+  /**
+   * The form `connectionType` came from: `--connection-type`,
+   * `SAP_CONNECTION_TYPE`, or `connection-type (config file)`. Only the CLI
+   * form beats an `SAP_CONNECTION_TYPE` the env file brings (as in 15.x).
+   */
+  connectionTypeSource?: string;
+
+  /**
+   * SAP system type: onprem | cloud | legacy (`--system-type`, `SAP_SYSTEM_TYPE`).
+   * The tools offered default to cloud. The connector, and whether the master
+   * system is asked of the system, default to cloud for a jwt destination and
+   * on-premise otherwise — stated, never guessed from the URL.
+   */
+  systemType?: 'onprem' | 'cloud' | 'legacy';
+  /**
+   * The form `systemType` came from: `--system-type`, `SAP_SYSTEM_TYPE`, or
+   * `system-type (config file)`. Only the CLI form beats an `SAP_SYSTEM_TYPE`
+   * the env file brings, as for the connection type.
+   */
+  systemTypeSource?: string;
+
+  /**
+   * The idle bound on held state: it ends after this many minutes without a
+   * tool call (`--state-idle-minutes`, `MCP_STATE_IDLE_MINUTES`,
+   * `state-idle-minutes`). A whole number, at least 30; default 30.
+   */
+  stateIdleMinutes?: number;
+
+  // ============================================================================
+  // LEGACY FIELDS (for v1 backward compatibility)
+  // ============================================================================
+
+  /** @deprecated Use mcpDestination instead */
+  defaultMcpDestination?: string;
+  /** @deprecated Use mcpDestination or envFilePath instead */
+  defaultDestination?: string;
+  /** Logger instance (v1 only) */
+  logger?: any;
+}

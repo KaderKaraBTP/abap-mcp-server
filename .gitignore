@@ -1,0 +1,118 @@
+# Dependency directories
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+.smithery/
+*.mcpb
+
+# NPM packages (local builds, releases are on GitHub)
+*.tgz
+!*.tgz  # But allow in releases
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env
+.mcpregistry_github_token
+.mcpregistry_registry_token
+
+# Test configuration (contains real transport requests and sensitive data)
+tests/test-config.yaml
+tests/test-config.*.yaml
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+doc/development/logs/*.log
+.getobjectslist.cache.json
+
+# Editor directories and files
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Lock state files (persistent lock handles)
+.locks/
+*.locks.json
+
+# Session state files (cookies, CSRF tokens)
+.sessions/
+*.sessions.json
+
+# Data directory (created by Docker containers)
+data/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Backup files
+*.bak
+
+*sk.json
+*.env
+
+# ANTLR4 generated files
+src/generated/
+tools/antlr/
+fr0ster-mcp-abap-adt-*.tgz
+
+
+
+*.d.ts
+*.d.ts.map
+mdd.json
+# A bare pattern matches at any depth, so this hides every package.json in the
+# tree, not the one it was written for. The root manifest survives only because
+# it was tracked before the rule existed; server/package.json was created after
+# and silently never committed — the server package had no manifest in git. It
+# happened AGAIN when the compact packages were added: three manifests missing
+# from the commit, and CI said `ENOENT .../compact-readonly/package.json`, not
+# "this file is ignored". Every manifest this repository publishes is listed
+# below; a new package adds its line here in the same commit that adds it.
+package.json
+!/package.json
+!/server/package.json
+!/compact-readonly/package.json
+!/compact-modify/package.json
+!/btp/package.json
+!/compact/package.json
+.npm-cache/**
+SAP_ADT.json
+dev.json
+desktop.ini
+.vscode/mcp.json
+.claude/settings.local.json
+.codex
+.worktrees/
+.mcp.json
+dist-portable/
+.superpowers/
+
+# SAP BTP Cloud Foundry (MTA) build output
+mta_archives/
+.abap-mcp-server_mta_build_tmp/
+*.mtar
+btp/vendor/
+btp/dist/
+btp/node_modules/
+btp/package-lock.json

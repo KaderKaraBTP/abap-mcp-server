@@ -1,0 +1,414 @@
+/**
+ * Builds an ABAP connection from settings and a credential.
+ *
+ * Which system a deployment dials, which credential it presents and which wire
+ * it uses are three independent facts. This is the one place in the server
+ * that builds a connector: the system kind and the wire follow from the
+ * settings (`resolveSystemKind`, `connectionType`); the credential is the one
+ * the caller hands in, and is never built here from `settings.authType`.
+ * Where a credential comes from is `credentialSources.ts` and the broker's
+ * `getProvider`.
+ */
+
+import {
+  AdtCloudConnector,
+  AdtOnPremConnector,
+  CloudHttpTransport,
+  type ILogger,
+  OnPremHttpTransport,
+  RfcTransport,
+  rfcConversationFrom,
+  type SapConfig,
+} from '@mcp-abap-adt/connection';
+import type { IAbapConnection } from '@mcp-abap-adt/interfaces-adt-connection';
+import type { IAuthProvider } from '@mcp-abap-adt/interfaces-auth';
+
+export type AbapSystemKind = 'onprem' | 'cloud';
+
+/**
+ * Which system this config dials.
+ *
+ * `SAP_SYSTEM_TYPE` states it outright and wins — `legacy` is an on-premise
+ * system, just an older one. Absent that, a JWT means cloud, which is what the
+ * removed factory did and what every existing deployment is therefore running
+ * on; changing that default silently would re-route live connections.
+ *
+ * The point of reading the variable first is that the guess now has an
+ * override: a bearer token against an on-premise system finally has a way to
+ * say so.
+ */
+export function resolveSystemKind(
+  config: SapConfig,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): AbapSystemKind {
+  const declared = env.SAP_SYSTEM_TYPE?.trim().toLowerCase();
+  if (declared === 'cloud') return 'cloud';
+  if (declared === 'onprem' || declared === 'legacy') return 'onprem';
+  return config.authType === 'jwt' ? 'cloud' : 'onprem';
+}
+
+/**
+ * Whether the RFC wire should log what it carries, and how much of it.
+ *
+ * **Off unless asked for, and asked for by environment rather than by
+ * argument.** The question this answers is diagnostic — "did the body we built
+ * reach `SADT_REST_RFC_ENDPOINT` intact?" — and it is asked by whoever is
+ * sitting in front of a misbehaving on-premise system, not by a caller writing
+ * code. An argument would have to be threaded through every call site for a
+ * switch nobody sets in production; an environment variable is read where the
+ * transport is built and nowhere else. `DEBUG_CONNECTORS` already works this
+ * way.
+ *
+ * `@mcp-abap-adt/connection` 8.1.0 is what made this possible, and it is also
+ * why the output is safe to paste into an issue: it replaces the values of
+ * `Authorization`, any `Cookie`, and anything matching `token`, `secret`,
+ * `password`, `credential` or an API key with `[redacted]` — keeping the
+ * names — and clips a body at `maxLoggedBodyChars`. Bodies themselves are not
+ * redacted, so a body carrying a credential would still be logged: this is for
+ * a payload under suspicion, not for routine logging.
+ *
+ * `DEBUG_RFC_BODY_CHARS` takes `0` for the size alone and `Infinity` for the
+ * whole body; anything unparseable is left to the package, which falls back to
+ * its own default rather than failing a connection over a debug option.
+ */
+/**
+ * The logger the RFC wire writes to, which the switch has to provide itself.
+ *
+ * **Asking for the wire and getting nothing is the failure this exists to
+ * prevent.** `RfcTransport` writes only when it has both `logWire` and a
+ * logger, and the server's own path builds its connection with no logger at
+ * all — `BaseMcpServer` passes `undefined`. So `DEBUG_RFC_WIRE=true` set the
+ * option, the transport checked for a logger, found none, and the documented
+ * switch did nothing on the one path that matters most.
+ *
+ * A caller's logger always wins: it is theirs, it may go somewhere specific,
+ * and this must not redirect it. Only when there is none does asking for the
+ * wire bring one, at `debug`, because a wire log below `debug` is a wire log
+ * nobody sees.
+ *
+ * **It writes to stderr, and that is not a preference.** In stdio transport —
+ * how this server is usually run — stdout carries JSON-RPC and nothing else.
+ * `DefaultLogger` puts `debug` and `info` on stdout, so supplying one here
+ * would interleave `RFC HEADERS: …` with the protocol and break the session
+ * with the client: a debug switch that takes the server down is worse than
+ * one that prints nothing, which is what this started as.
+ *
+ * stderr is where a server's diagnostics belong for exactly this reason, and
+ * it is where `DefaultLogger` already puts `warn` and `error` — so this is
+ * that logger's own convention applied to the two levels it does not.
+ */
+function wireLogger(logger: ILogger | null | undefined): ILogger | undefined {
+  if (logger) return logger;
+  if (!rfcWireOptions().logWire) return undefined;
+
+  const write =
+    (level: string) =>
+    (message: string, meta?: unknown): void => {
+      process.stderr.write(`[${level}] ${message}\n`);
+      if (meta !== undefined) process.stderr.write(`${JSON.stringify(meta)}\n`);
+    };
+
+  return {
+    debug: write('DEBUG'),
+    info: write('INFO'),
+    warn: write('WARN'),
+    error: write('ERROR'),
+  };
+}
+
+function rfcWireOptions(): { logWire: boolean; maxLoggedBodyChars?: number } {
+  const asked =
+    process.env.DEBUG_RFC_WIRE === 'true' || process.env.DEBUG_RFC_WIRE === '1';
+  const ceiling = process.env.DEBUG_RFC_BODY_CHARS;
+  return {
+    logWire: asked,
+    ...(ceiling === undefined || ceiling === ''
+      ? {}
+      : {
+          maxLoggedBodyChars:
+            ceiling === 'Infinity' ? Number.POSITIVE_INFINITY : Number(ceiling),
+        }),
+  };
+}
+
+/**
+ * Every HTTP exchange on stderr, when asked for it.
+ *
+ * **Why this exists here.** There is no HTTP wire log anywhere else:
+ * `@mcp-abap-adt/connection` logs the session, the CSRF token and the critical
+ * section, and nothing about a request — measured 2026-09-28 by reading
+ * `AbstractAbapConnection.js` and `HttpTransport.js`. `DEBUG_CONNECTORS` and
+ * `DEBUG_ADT_LIBS` therefore answer nothing when the question is *what did we
+ * send and what came back*, and `logWire` is an RFC transport option that the
+ * HTTP transports do not take.
+ *
+ * That cost a whole diagnostic cycle: `CheckPackage` answered `isError: true`
+ * for the polygon's own package with no message and no request, and the reason —
+ * a guard refusing before the wire — was only visible by writing a throwaway
+ * script that wrapped `makeAdtRequest` by hand. A switch belongs where the
+ * connection is built, so the next such failure is readable from a test log.
+ *
+ * **Redaction.** Header VALUES are replaced by name — `authorization`, any
+ * `cookie`, and anything containing `token`, `secret`, `password`, `credential`
+ * or `apikey` — which is the rule `@mcp-abap-adt/connection` 8.1.0 applies to
+ * the RFC wire. Bodies are printed as they are, clipped at
+ * `DEBUG_HTTP_BODY_CHARS` (default 2000, `0` for the size alone, `Infinity` for
+ * all of it): this is for a payload under suspicion, not for routine logging,
+ * and a body carrying a credential would be logged.
+ *
+ * stderr, for the reason `wireLogger` gives above: in stdio transport stdout
+ * carries JSON-RPC and nothing else.
+ */
+const REDACTED =
+  /authorization|^(cookie|set-cookie)$|token|secret|password|credential|apikey|api-key/i;
+
+function httpWireOptions(): { logWire: boolean; bodyChars: number } {
+  const asked =
+    process.env.DEBUG_HTTP_WIRE === 'true' ||
+    process.env.DEBUG_HTTP_WIRE === '1';
+  const ceiling = process.env.DEBUG_HTTP_BODY_CHARS;
+  const bodyChars =
+    ceiling === undefined || ceiling === ''
+      ? 2000
+      : ceiling === 'Infinity'
+        ? Number.POSITIVE_INFINITY
+        : Number(ceiling);
+  return {
+    logWire: asked,
+    bodyChars:
+      Number.isFinite(bodyChars) || bodyChars === Number.POSITIVE_INFINITY
+        ? bodyChars
+        : 2000,
+  };
+}
+
+function clip(value: unknown, ceiling: number): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (text === undefined || text === null) return '';
+  if (ceiling === 0) return `(${text.length} chars, not logged)`;
+  return text.length > ceiling
+    ? `${text.slice(0, ceiling)}… (${text.length} chars)`
+    : text;
+}
+
+function safeHeaders(headers: unknown): string {
+  if (headers === null || typeof headers !== 'object') return '';
+  const out: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(
+    headers as Record<string, unknown>,
+  )) {
+    out[name] = REDACTED.test(name) ? '[redacted]' : value;
+  }
+  return JSON.stringify(out);
+}
+
+/**
+ * Wrap `makeAdtRequest` so each exchange prints. Returns the connection
+ * untouched when the switch is off — no wrapper, no cost, no behaviour to
+ * explain in production.
+ */
+function withHttpWireLog<T>(connection: T): T {
+  const { logWire, bodyChars } = httpWireOptions();
+  if (!logWire) return connection;
+  const target = connection as unknown as {
+    makeAdtRequest: (options: Record<string, unknown>) => Promise<unknown>;
+  };
+  const original = target.makeAdtRequest.bind(target);
+  let n = 0;
+  target.makeAdtRequest = async (options) => {
+    n += 1;
+    const id = n;
+    process.stderr.write(
+      `[WIRE ${id}] ${String(options.method ?? '?')} ${String(options.url ?? '?')}\n`,
+    );
+    if (options.params !== undefined) {
+      process.stderr.write(
+        `[WIRE ${id}] params ${JSON.stringify(options.params)}\n`,
+      );
+    }
+    if (options.headers !== undefined) {
+      process.stderr.write(
+        `[WIRE ${id}] headers ${safeHeaders(options.headers)}\n`,
+      );
+    }
+    if (options.data !== undefined) {
+      process.stderr.write(
+        `[WIRE ${id}] body ${clip(options.data, bodyChars)}\n`,
+      );
+    }
+    try {
+      const answer = (await original(options)) as {
+        status?: number;
+        statusText?: string;
+        data?: unknown;
+      };
+      process.stderr.write(
+        `[WIRE ${id}] → ${String(answer?.status ?? '?')} ${String(answer?.statusText ?? '')}\n`,
+      );
+      if (answer?.data !== undefined) {
+        process.stderr.write(
+          `[WIRE ${id}] → body ${clip(answer.data, bodyChars)}\n`,
+        );
+      }
+      return answer;
+    } catch (error: unknown) {
+      const e = error as {
+        message?: string;
+        response?: { status?: number; data?: unknown };
+      };
+      process.stderr.write(
+        `[WIRE ${id}] → threw ${String(e?.response?.status ?? '')} ${String(e?.message ?? error)}\n`,
+      );
+      if (e?.response?.data !== undefined) {
+        process.stderr.write(
+          `[WIRE ${id}] → body ${clip(e.response.data, bodyChars)}\n`,
+        );
+      }
+      throw error;
+    }
+  };
+  return connection;
+}
+
+/**
+ * An HTTP forward proxy the wire sends through — the shape axios takes.
+ *
+ * **Why this exists.** On SAP BTP Cloud Foundry an on-premise system is
+ * reached through the Connectivity service: every request goes to the
+ * connectivity proxy (`onpremise_proxy_host:onpremise_proxy_http_port`) with
+ * the virtual host of the Cloud Connector as its target. The transports build
+ * their own axios client, so the proxy has to be said here, where the
+ * connection is built; the proxy's own credential (`Proxy-Authorization`) is
+ * the credential's, presented per request like any other header.
+ */
+export interface HttpProxy {
+  protocol: 'http' | 'https';
+  host: string;
+  port: number;
+}
+
+/** Which proxy, if any, a connection built from these settings sends through. */
+export type HttpProxyResolver = (settings: SapConfig) => HttpProxy | undefined;
+
+let httpProxyResolver: HttpProxyResolver | undefined;
+
+/**
+ * States the proxy resolver for every HTTP connection built from now on;
+ * `undefined` removes it. Off unless a host sets it: without it nothing
+ * changes, and axios keeps its own reading of the environment.
+ */
+export function setHttpProxyResolver(resolver?: HttpProxyResolver): void {
+  httpProxyResolver = resolver;
+}
+
+/**
+ * Puts the resolved proxy on the transport's axios client. The client is built
+ * lazily and rebuilt when TLS material changes, so the proxy is set on every
+ * client the transport hands out, not once.
+ */
+function withHttpProxy<T>(transport: T, settings: SapConfig): T {
+  const proxy = httpProxyResolver?.(settings);
+  if (!proxy) return transport;
+  const target = transport as unknown as {
+    client: () => { defaults: { proxy?: unknown } };
+  };
+  const original = target.client.bind(target);
+  target.client = () => {
+    const client = original();
+    client.defaults.proxy = proxy;
+    return client;
+  };
+  return transport;
+}
+
+/** How a connection was built, so a sibling can be opened exactly like it. */
+export interface ConnectionRecord {
+  settings: SapConfig;
+  credential: IAuthProvider;
+  logger?: ILogger | null;
+}
+
+const records = new WeakMap<object, ConnectionRecord>();
+
+/**
+ * The system kind a connection was built for: `resolveSystemKind` of the
+ * settings the factory recorded. A connection the factory did not build (an
+ * embedder's own) has no settings: the kind the server states for it
+ * (`declared`, the server's `systemType` option) wins, then
+ * `SAP_SYSTEM_TYPE`, else on-premise. The URL decides nothing.
+ */
+export function systemKindOf(
+  connection: object,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+  declared?: string,
+): AbapSystemKind {
+  const record = records.get(connection);
+  if (record) return resolveSystemKind(record.settings, env);
+  const stated = declared ? { SAP_SYSTEM_TYPE: declared } : env;
+  return resolveSystemKind({} as SapConfig, stated);
+}
+
+/** The record of a connection this factory built; undefined for any other. */
+export function siblingRecordOf(
+  connection: object,
+): ConnectionRecord | undefined {
+  return records.get(connection);
+}
+
+export function createAbapConnection(
+  settings: SapConfig,
+  credential: IAuthProvider,
+  logger?: ILogger | null,
+  sessionId?: string,
+): IAbapConnection {
+  const transportOptions = { client: settings.client, baseUrl: settings.url };
+
+  const built = ((): IAbapConnection => {
+    if (resolveSystemKind(settings) === 'cloud') {
+      return withHttpWireLog(
+        new AdtCloudConnector(
+          settings,
+          credential,
+          withHttpProxy(
+            new CloudHttpTransport(() => ({}), logger, transportOptions),
+            settings,
+          ),
+          logger,
+          sessionId,
+        ) as unknown as IAbapConnection,
+      );
+    }
+
+    if (settings.connectionType === 'rfc') {
+      return new AdtOnPremConnector(
+        settings,
+        credential,
+        new RfcTransport(
+          rfcConversationFrom(settings),
+          wireLogger(logger),
+          rfcWireOptions(),
+        ),
+        logger,
+        sessionId,
+      ) as unknown as IAbapConnection;
+    }
+
+    // TLS material reaches the wire through the logon, not through the
+    // transport's options.
+    return withHttpWireLog(
+      new AdtOnPremConnector(
+        settings,
+        credential,
+        withHttpProxy(
+          new OnPremHttpTransport(() => ({}), logger, transportOptions),
+          settings,
+        ),
+        logger,
+        sessionId,
+      ) as unknown as IAbapConnection,
+    );
+  })();
+
+  records.set(built as unknown as object, { settings, credential, logger });
+  return built;
+}

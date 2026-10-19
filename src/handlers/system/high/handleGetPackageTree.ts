@@ -1,0 +1,159 @@
+/**
+ * GetPackageTree Handler - High-level handler for package tree structure
+ *
+ * Builds a complete tree of package contents (subpackages + objects)
+ * walking the repository one node level at a time. See lib/strategies/packageWalk.
+ */
+
+import { analyseException } from '@mcp-abap-adt/adt-strategies';
+import { createAdtClient } from '../../../lib/clients';
+import type { HandlerContext } from '../../../lib/handlers/interfaces';
+import { assembleTree, walkPackage } from '../../../lib/strategies/packageWalk';
+import { ourUtils } from '../../../lib/strategies/resultSets';
+import { return_error, return_response } from '../../../lib/utils';
+
+export const TOOL_DEFINITION = {
+  name: 'GetPackageTree',
+  available_in: ['onprem', 'cloud'] as const,
+  description:
+    '[high-level] Retrieve complete package tree structure including subpackages and objects. Returns hierarchical tree with object names, types, and descriptions.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      package_name: {
+        type: 'string',
+        description: 'Package name',
+      },
+      include_subpackages: {
+        type: 'boolean',
+        description:
+          'Include subpackages recursively in the tree. If false, subpackages are shown as first-level objects but not recursively expanded. Default: true',
+        default: true,
+      },
+      max_depth: {
+        type: 'integer',
+        description:
+          'Maximum depth for recursive package traversal. Default: 5',
+        default: 5,
+      },
+      include_descriptions: {
+        type: 'boolean',
+        description: 'Include object descriptions in response. Default: true',
+        default: true,
+      },
+      debug: {
+        type: 'boolean',
+        description:
+          'Include diagnostic metadata in response (counts, types, hierarchy info). Default: false',
+        default: false,
+      },
+    },
+    required: ['package_name'],
+  },
+} as const;
+
+interface GetPackageTreeArgs {
+  package_name: string;
+  include_subpackages?: boolean;
+  max_depth?: number;
+  include_descriptions?: boolean;
+  debug?: boolean;
+}
+
+/**
+ * Main handler for GetPackageTree MCP tool
+ */
+export async function handleGetPackageTree(
+  context: HandlerContext,
+  args: GetPackageTreeArgs,
+) {
+  const { connection, logger } = context;
+  try {
+    // Validate required parameters
+    if (!args?.package_name) {
+      return return_error(new Error('package_name is required'));
+    }
+
+    const packageName = args.package_name.toUpperCase();
+    const includeSubpackages = args.include_subpackages !== false;
+    const maxDepth = args.max_depth || 5;
+    const includeDescriptions = args.include_descriptions !== false;
+
+    logger?.info(
+      `Fetching package tree for ${packageName} (include_subpackages: ${includeSubpackages}, max_depth: ${maxDepth}) using adt-clients`,
+    );
+
+    const client = createAdtClient(connection, logger);
+    const utils = client.getUtils(ourUtils);
+
+    // Verify package exists before building tree (fixes #38).
+    // `IPackageContract` has no `.read()` — a package is a container with no
+    // source of its own, so `readMetadata` is the one call (see
+    // `handleReadPackage.ts`, migrated the same way). Without an `analyse`
+    // strategy the default error contract still answers `ok: false` for a
+    // refusal, which is all a plain existence check needs — no message
+    // enrichment is read here, only the boolean.
+    //
+    // **Fix round 1, task 25.** The pre-migration code branched on the wire
+    // status: a 404 said "not found", anything else rethrew the original
+    // error unworded. The first pass here collapsed every refusal — a lock,
+    // a permission failure, a connection error, an actual not-found — into
+    // one hardcoded "not found" message, which is wrong for every refusal
+    // that is not one. `readMetadata`'s default error strategy carries no
+    // status/code to branch on the way the old 404 check did, so rather than
+    // guess a code this has not measured, the message says only what is
+    // true of every case: the read did not produce a document.
+    const readResult = await client
+      .getPackage()
+      .readMetadata({ packageName }, { analyse: analyseException });
+    if (!readResult.ok) {
+      return return_error(
+        new Error(
+          `Package ${packageName} could not be read: ${readResult.getError().message}`,
+        ),
+      );
+    }
+
+    // Walked here, not in the client. `getPackageHierarchy` makes one request
+    // per object type plus a walk into subpackages, so `IResultStrategy`, which
+    // reads ONE answer, cannot be given to it — and between it and
+    // `getPackageContentsList` the library had already chosen the shape for us.
+    // `fetchNodeStructure` is one request and takes our reading, so the walk is
+    // composed of steps we can read and the assembly is ours.
+    // See mcp-abap-adt-clients#141.
+    const packageTree = assembleTree(
+      packageName,
+      await walkPackage(utils, packageName, {
+        includeSubpackages,
+        maxDepth,
+        includeDescriptions,
+      }),
+    );
+
+    if (!packageTree) {
+      return return_error(
+        new Error(`Failed to fetch package tree for ${packageName}`),
+      );
+    }
+
+    logger?.debug(`Package tree fetched successfully for ${packageName}`);
+
+    // Format response
+    const response = {
+      package_name: packageName,
+      tree: packageTree,
+      metadata: {
+        include_subpackages: includeSubpackages,
+        max_depth: maxDepth,
+        include_descriptions: includeDescriptions,
+      },
+    };
+
+    return return_response({
+      data: JSON.stringify(response, null, 2),
+    } as any);
+  } catch (error: any) {
+    logger?.error('Failed to fetch package tree', error);
+    return return_error(error);
+  }
+}

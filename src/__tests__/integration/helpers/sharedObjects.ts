@@ -1,0 +1,560 @@
+/**
+ * Shared Dependencies Management — soft mode (direct adt-clients calls)
+ *
+ * Ensures shared prerequisite objects exist in SAP and match YAML config.
+ * Used by tests that depend on shared objects (e.g., BehaviorImplementation depends on BDEF).
+ *
+ * Always runs in soft mode — no MCP server process needed.
+ *
+ * Commands:
+ *   npm run shared:setup    — create all shared dependencies in order
+ *   npm run shared:teardown — delete all shared dependencies in reverse order
+ *   npm run shared:check    — validate config consistency (offline)
+ */
+
+import type { AdtClient } from '@mcp-abap-adt/adt-clients';
+import {
+  analyseActivation,
+  analyseException,
+} from '@mcp-abap-adt/adt-strategies';
+import type { IAdtError, IAdtResponse } from '@mcp-abap-adt/interfaces-adt';
+import type { IAbapConnection } from '@mcp-abap-adt/interfaces-adt-connection';
+import type { ILogger } from '@mcp-abap-adt/interfaces-utils';
+import { createAdtClient } from '../../../lib/clients';
+import { withLock } from '../../../lib/strategies/withLock';
+import {
+  getSharedDependenciesConfig,
+  getSystemType,
+  loadTestConfig,
+  resolveSharedDependency,
+} from './configHelpers';
+import { createTestLogger } from './loggerHelpers';
+import { createTestConnectionAndSession } from './sessionHelpers';
+
+const logger = createTestLogger('shared-objects');
+
+export interface SharedObjectResult {
+  success: boolean;
+  name: string;
+  action: 'verified' | 'created' | 'updated' | 'skipped';
+  reason?: string;
+}
+
+/** In-memory cache to skip re-verification within the same process */
+const _verifiedDependencies: Record<string, boolean> = {};
+let _sharedPackageReady = false;
+
+/**
+ * Normalize source code for comparison: trim lines, collapse whitespace, remove empty lines.
+ */
+function normalizeSource(source: string): string {
+  return source
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function resolveTransportRequest(override?: string): string | undefined {
+  if (override) return override;
+  const config = loadTestConfig();
+  return config?.environment?.default_transport || undefined;
+}
+
+function resolvePackageName(override?: string): string {
+  if (override) return override;
+  const sharedConfig = getSharedDependenciesConfig();
+  if (sharedConfig?.package) return sharedConfig.package;
+  const config = loadTestConfig();
+  return config?.environment?.default_package || 'ZLOCAL';
+}
+
+/**
+ * Ensure the shared sub-package exists (create if missing).
+ * Skips after first successful verification (in-memory flag).
+ */
+export async function ensureSharedPackage(
+  client: AdtClient,
+  log?: ILogger,
+): Promise<void> {
+  if (_sharedPackageReady) return;
+
+  const sharedConfig = getSharedDependenciesConfig();
+  if (!sharedConfig?.package) return;
+
+  const packageName = sharedConfig.package;
+
+  // Check if package exists. A package has no source, only its own document
+  // (IAdtMetadataReadable, not IAdtReadable) — see IAdtCapabilities.ts.
+  try {
+    const readResult = await client
+      .getPackage()
+      .readMetadata({ packageName }, { analyse: analyseException });
+    if (readResult.ok) {
+      log?.info?.(`Shared package ${packageName} already exists`);
+      _sharedPackageReady = true;
+      return;
+    }
+  } catch {
+    // Package doesn't exist — will create below
+  }
+
+  // On legacy systems, package read/create not available via ADT — trust the user
+  if (getSystemType() === 'legacy') {
+    log?.info?.(
+      `Legacy system: assuming package ${packageName} exists (create via SE80/SE21 if missing)`,
+    );
+    _sharedPackageReady = true;
+    return;
+  }
+
+  // Create the package
+  try {
+    const transportRequest = resolveTransportRequest(
+      sharedConfig.transport_request,
+    );
+    // A refusal arrives in the answer, not as a throw: the `catch` below was
+    // written when `create()` threw. It is still the right home for a connection
+    // failure, and the "already exists" case it recognises now reaches it from
+    // here — but awaiting without reading logged "Created shared package" over a
+    // package that was never created.
+    const createdPackage = await client.getPackage().create(
+      {
+        packageName,
+        description: 'Shared test dependencies package',
+        superPackage: sharedConfig.super_package,
+        softwareComponent: sharedConfig.software_component || undefined,
+        transportLayer: sharedConfig.transport_layer || undefined,
+        // A super package that records changes needs it of the package: the
+        // system refuses one without ("Change recording must be activated").
+        recordChanges: sharedConfig.record_changes === true || undefined,
+        packageType: 'development',
+        transportRequest,
+      },
+      { analyse: analyseException },
+    );
+    if (!createdPackage.ok) {
+      throw new Error(createdPackage.getError().message);
+    }
+    log?.info?.(`Created shared package ${packageName}`);
+  } catch (error: any) {
+    if (
+      error.message?.includes('409') ||
+      error.message?.includes('already exist')
+    ) {
+      log?.info?.(`Shared package ${packageName} already exists`);
+    } else {
+      log?.warn?.(
+        `Failed to create shared package ${packageName}: ${error.message}`,
+      );
+      throw error;
+    }
+  }
+
+  _sharedPackageReady = true;
+}
+
+/**
+ * Ensure a shared dependency object exists. Creates it if missing, never deletes.
+ * Uses in-memory cache to skip verification after first check.
+ *
+ * @returns { existed: boolean, created: boolean }
+ */
+export async function ensureSharedDependency(
+  client: AdtClient,
+  type: string,
+  name: string,
+  log?: ILogger,
+  options?: { skipActivation?: boolean },
+): Promise<{ existed: boolean; created: boolean }> {
+  const cacheKey = `${type}:${name}`;
+  if (_verifiedDependencies[cacheKey]) {
+    log?.info?.(`Shared ${type} ${name} already verified, skipping`);
+    return { existed: true, created: false };
+  }
+
+  const depConfig = resolveSharedDependency(type, name);
+  if (!depConfig) {
+    throw new Error(
+      `Shared dependency ${type}:${name} not found in shared_dependencies config`,
+    );
+  }
+
+  // Skip if not available for current system type
+  const availableIn = depConfig.available_in as string[] | undefined;
+  if (availableIn && availableIn.length > 0) {
+    const systemType = getSystemType();
+    if (!availableIn.includes(systemType)) {
+      log?.info?.(
+        `Shared ${type} ${name} not available on ${systemType}, skipping`,
+      );
+      return { existed: false, created: false };
+    }
+  }
+
+  const packageName = resolvePackageName();
+  const transportRequest = resolveTransportRequest();
+
+  // Check if the object already exists. Nothing here throws any more — a
+  // missing object is `ok: false`, not a rejected promise (IAdtCapabilities.ts)
+  // — so existence is read off `.ok`, and the try/catch stays only for a
+  // genuine connection-level throw.
+  let exists = false;
+  try {
+    if (type === 'tables') {
+      const result = await client
+        .getTable()
+        .read({ tableName: name }, undefined, { analyse: analyseException });
+      exists = result.ok;
+    } else if (type === 'views') {
+      const result = await client
+        .getDdl()
+        .read({ ddlName: name }, undefined, { analyse: analyseException });
+      exists = result.ok;
+    } else if (type === 'behavior_definitions') {
+      const result = await client
+        .getBehaviorDefinition()
+        .read({ name }, undefined, { analyse: analyseException });
+      exists = result.ok;
+    }
+  } catch {
+    exists = false;
+  }
+
+  if (exists) {
+    log?.info?.(`Shared ${type} ${name} already exists`);
+    _verifiedDependencies[cacheKey] = true;
+    return { existed: true, created: false };
+  }
+
+  // Create the object. `create` posts a metadata document only — no create
+  // implementation in adt-clients 19 carries source (IAdtCreatable.create's
+  // own comment) — so the source, when there is one, goes through a
+  // lock -> update -> unlock -> activate cycle afterwards, the same shape
+  // every migrated UpdateX handler in src/handlers uses via `withLock`.
+  log?.info?.(`Creating shared ${type} ${name}...`);
+  try {
+    const activate = !options?.skipActivation;
+
+    if (type === 'tables') {
+      const created = await client.getTable().create(
+        {
+          tableName: name,
+          packageName,
+          description: depConfig.description || 'Shared test table',
+          transportRequest,
+        },
+        { analyse: analyseException },
+      );
+      if (!created.ok) throw new Error(created.getError().message);
+
+      if (depConfig.source && activate) {
+        log?.info?.(`Activating shared table ${name}...`);
+        const obj = client.getTable();
+        const written = await withLock(
+          () => obj.lock({ tableName: name }, { analyse: analyseException }),
+          (lockHandle) =>
+            obj.update(
+              { tableName: name, transportRequest },
+              {
+                source: depConfig.source,
+                lockHandle,
+                analyse: analyseException,
+              },
+            ),
+          (lockHandle) =>
+            obj.unlock({ tableName: name }, lockHandle, {
+              analyse: analyseException,
+            }),
+        );
+        if (!written.ok) throw new Error(written.getError().message);
+
+        const activated = await obj.activate(
+          { tableName: name },
+          { analyse: analyseActivation },
+        );
+        if (!activated.ok) throw new Error(activated.getError().message);
+        log?.info?.(`Shared table ${name} activated`);
+      }
+    } else if (type === 'views') {
+      const created = await client.getDdl().create(
+        {
+          ddlName: name,
+          packageName,
+          description: depConfig.description || 'Shared test view',
+          transportRequest,
+        },
+        { analyse: analyseException },
+      );
+      if (!created.ok) throw new Error(created.getError().message);
+
+      if (depConfig.source && activate) {
+        log?.info?.(`Activating shared view ${name}...`);
+        const obj = client.getDdl();
+        const written = await withLock(
+          () => obj.lock({ ddlName: name }, { analyse: analyseException }),
+          (lockHandle) =>
+            obj.update(
+              { ddlName: name, transportRequest },
+              {
+                source: depConfig.source,
+                lockHandle,
+                analyse: analyseException,
+              },
+            ),
+          (lockHandle) =>
+            obj.unlock({ ddlName: name }, lockHandle, {
+              analyse: analyseException,
+            }),
+        );
+        if (!written.ok) throw new Error(written.getError().message);
+
+        const activated = await obj.activate(
+          { ddlName: name },
+          { analyse: analyseActivation },
+        );
+        if (!activated.ok) throw new Error(activated.getError().message);
+        log?.info?.(`Shared view ${name} activated`);
+      }
+    } else if (type === 'behavior_definitions') {
+      const created = await client.getBehaviorDefinition().create(
+        {
+          name,
+          packageName,
+          rootEntity: depConfig.root_entity || name,
+          implementationType: depConfig.implementation_type || 'Managed',
+          description: depConfig.description || 'Shared test BDEF',
+          transportRequest,
+        },
+        { analyse: analyseException },
+      );
+      if (!created.ok) throw new Error(created.getError().message);
+
+      if (depConfig.source && activate) {
+        log?.info?.(`Activating shared behavior definition ${name}...`);
+        const obj = client.getBehaviorDefinition();
+        const written = await withLock(
+          () => obj.lock({ name }, { analyse: analyseException }),
+          (lockHandle) =>
+            obj.update(
+              { name, transportRequest },
+              {
+                source: depConfig.source,
+                lockHandle,
+                analyse: analyseException,
+              },
+            ),
+          (lockHandle) =>
+            obj.unlock({ name }, lockHandle, { analyse: analyseException }),
+        );
+        if (!written.ok) throw new Error(written.getError().message);
+
+        const activated = await obj.activate(
+          { name },
+          { analyse: analyseActivation },
+        );
+        if (!activated.ok) throw new Error(activated.getError().message);
+        log?.info?.(`Shared behavior definition ${name} activated`);
+      }
+    }
+    log?.info?.(`Created shared ${type} ${name}`);
+    _verifiedDependencies[cacheKey] = true;
+    return { existed: false, created: true };
+  } catch (error: any) {
+    if (
+      error.message?.includes('409') ||
+      error.message?.includes('already exist')
+    ) {
+      log?.info?.(
+        `Shared ${type} ${name} already exists (concurrent creation)`,
+      );
+      _verifiedDependencies[cacheKey] = true;
+      return { existed: true, created: false };
+    }
+    throw error;
+  }
+}
+
+/** Try to delete an object; ignore 404 (already gone) */
+export async function safeDelete(
+  label: string,
+  deleteFn: () => Promise<IAdtResponse<unknown, IAdtError> | void>,
+  log?: ILogger,
+): Promise<'deleted' | 'not_found' | 'failed'> {
+  // **A refused delete arrives in the answer.** This classified a thrown
+  // message, which is what a refusal was until adt-clients 23 — since then a
+  // delete ADT refused answers `ok: false` and throws nothing, so every call
+  // reported `'deleted'` and a teardown printed "Deleted" over objects still on
+  // the system, which the next setup would find in its way. The throw path stays
+  // for what still throws: a connection failure.
+  try {
+    const answered = await deleteFn();
+    if (answered !== undefined && !answered.ok) {
+      return classifyDeleteFailure(label, answered.getError().message, log);
+    }
+    log?.info?.(`Deleted ${label}`);
+    return 'deleted';
+  } catch (error: any) {
+    return classifyDeleteFailure(
+      label,
+      error instanceof Error ? error.message : String(error),
+      log,
+    );
+  }
+}
+
+/** An object that was never there is not a failed teardown. */
+function classifyDeleteFailure(
+  label: string,
+  msg: string,
+  log?: ILogger,
+): 'not_found' | 'failed' {
+  if (
+    msg.includes('404') ||
+    msg.includes('not found') ||
+    msg.includes('does not exist')
+  ) {
+    log?.info?.(`${label} — already gone (404)`);
+    return 'not_found';
+  }
+  log?.error?.(`Failed to delete ${label}: ${msg}`);
+  return 'failed';
+}
+
+/** Clear in-memory caches for shared dependencies */
+export function resetSharedDependencyCache(): void {
+  _sharedPackageReady = false;
+  for (const key of Object.keys(_verifiedDependencies)) {
+    delete _verifiedDependencies[key];
+  }
+}
+
+/**
+ * Verify all shared dependencies from YAML exist in SAP.
+ * Call this in beforeAll() of tests that depend on shared objects.
+ *
+ * Verify-only mode — does NOT auto-create. If a dependency is missing,
+ * returns success=false with a message to run `npm run shared:setup`.
+ *
+ * Always creates its own connection (soft mode) — works regardless of hard/soft mode context.
+ */
+export async function ensureSharedObjects(
+  connection?: IAbapConnection | null,
+  adtLogger?: ILogger,
+): Promise<SharedObjectResult[]> {
+  const sharedConfig = getSharedDependenciesConfig();
+  if (!sharedConfig) {
+    logger?.info?.('No shared_dependencies in config, skipping');
+    return [];
+  }
+
+  // Ensure we have a real connection (not an empty stub from hard mode)
+  let conn = connection;
+  if (!conn || typeof (conn as any).makeAdtRequest !== 'function') {
+    try {
+      const result = await createTestConnectionAndSession();
+      conn = result.connection;
+    } catch (connError: any) {
+      logger?.warn?.(
+        `Cannot create connection for shared objects: ${connError.message}`,
+      );
+      return [
+        {
+          success: false,
+          name: '',
+          action: 'skipped',
+          reason: `Cannot create connection: ${connError.message}`,
+        },
+      ];
+    }
+  }
+
+  const client = createAdtClient(conn!, adtLogger);
+  const results: SharedObjectResult[] = [];
+
+  // Verify all shared deps exist (read-only check)
+  const typeOrder: Array<{
+    type: string;
+    readFn: (name: string) => Promise<any>;
+  }> = [
+    {
+      type: 'tables',
+      readFn: (name) =>
+        client
+          .getTable()
+          .read({ tableName: name }, undefined, { analyse: analyseException }),
+    },
+    {
+      type: 'views',
+      readFn: (name) =>
+        client
+          .getDdl()
+          .read({ ddlName: name }, undefined, { analyse: analyseException }),
+    },
+    {
+      type: 'behavior_definitions',
+      readFn: (name) =>
+        client
+          .getBehaviorDefinition()
+          .read({ name }, undefined, { analyse: analyseException }),
+    },
+    {
+      type: 'classes',
+      readFn: (name) =>
+        client
+          .getClass()
+          .read({ className: name }, undefined, { analyse: analyseException }),
+    },
+  ];
+
+  const systemType = getSystemType();
+
+  for (const { type, readFn } of typeOrder) {
+    const items = sharedConfig[type];
+    if (!Array.isArray(items) || items.length === 0) continue;
+
+    for (const item of items) {
+      // Skip items not available for current system type
+      const availableIn = item.available_in as string[] | undefined;
+      if (
+        availableIn &&
+        availableIn.length > 0 &&
+        !availableIn.includes(systemType)
+      ) {
+        logger?.info?.(
+          `Shared ${type} "${item.name}" not available on ${systemType}, skipping`,
+        );
+        results.push({
+          success: true,
+          name: item.name,
+          action: 'skipped',
+          reason: `Not available on ${systemType}`,
+        });
+        continue;
+      }
+
+      try {
+        await readFn(item.name);
+        results.push({ success: true, name: item.name, action: 'verified' });
+      } catch {
+        const msg = `Shared ${type} "${item.name}" not found in SAP. Run: npm run shared:setup`;
+        logger?.error?.(msg);
+        results.push({
+          success: false,
+          name: item.name,
+          action: 'skipped',
+          reason: msg,
+        });
+      }
+    }
+  }
+
+  const missing = results.filter((r) => !r.success);
+  if (missing.length > 0) {
+    logger?.error?.(
+      `${missing.length} shared dependencies missing. Run: npm run shared:setup`,
+    );
+  }
+
+  return results;
+}

@@ -1,0 +1,237 @@
+/**
+ * UpdatePackage Handler - Update ABAP Package Description
+ *
+ * Read, patch, write. adt-clients 19 removed the merge that used to happen
+ * inside `updatePackage`: the member takes the whole document now and
+ * replaces with it, so anything not sent is gone. The sequence is the
+ * handler's, and every step of it carries its own `analyse` — the verdict on
+ * each answer stays the strategy's.
+ *
+ * **The patched document goes in `options.source`.** `interfaces-adt@9`
+ * merged the old `config.document`/`options.sourceCode` split into one
+ * channel (decision 33) and took `document` off `IPackageConfig`, so the old
+ * shape no longer compiles. `AdtPackage.updateMetadata()` reads
+ * `options?.source` and passes it straight to `updatePackage(connection,
+ * {...}, source, options?.lockHandle)` as the PUT body — every other field it
+ * builds into
+ * that `fields` object (`superPackage`, `softwareComponent`,
+ * `transportLayer`, `description`, `packageType`, `responsible`,
+ * `recordChanges`) describes a create and is never read to build or merge a
+ * body on an update; only `package_name` (for the URL path) and
+ * `transport_request` (the write-query string) reach the wire function at
+ * all. Verified against `AdtPackage.ts` and `core/package/update.ts`.
+ *
+ * **And `transport_request` was named in that sentence while the schema never
+ * offered it.** `core/package/update.ts` appends `&corrNr=` when a transport is
+ * given, and `IPackageConfig` declares `transportRequest`, so a transportable
+ * package could not be updated through this tool at all: the on-premise answer
+ * is `SADT_RESOURCE 017`, *"Parameter corrNr could not be found."* — the same
+ * refusal the seven low-tier writes in this branch were fixed for. It is a
+ * parameter now, and it travels in the config, which is where the wire function
+ * reads it.
+ */
+
+import { analyseException } from '@mcp-abap-adt/adt-strategies';
+import { answer } from '../../../lib/answer';
+import { createAdtClient } from '../../../lib/clients';
+import type { HandlerContext } from '../../../lib/handlers/interfaces';
+import { connectionHoldingPackageLock } from '../../../lib/packageSessions';
+import { patchPackageXml } from '../../../lib/strategies/packagePatch';
+import { sequence } from '../../../lib/strategies/sequence';
+import { extractXmlString } from '../../../lib/strategies/xmlPatch';
+import {
+  type AxiosResponse,
+  restoreSessionInConnection,
+  return_error,
+  return_response,
+} from '../../../lib/utils';
+
+export const TOOL_DEFINITION = {
+  name: 'UpdatePackageLow',
+  available_in: ['onprem', 'cloud'] as const,
+  description:
+    '[low-level] Update description of an existing ABAP package. Requires lock_handle from LockPackage. super_package is required by this schema but not read by the update endpoint — see its own parameter description. A package can be saved only once per ABAP session (PAK/058 "Package … is already locked" otherwise). Over RFC this runs in the session LockPackageLow opened for this lock_handle; over HTTP it runs outside the stateful context of the lock. Call UnlockPackageLow afterwards, whatever this answers.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      package_name: {
+        type: 'string',
+        description: 'Package name. Package must already exist.',
+      },
+      super_package: {
+        type: 'string',
+        description:
+          'Does not reach the update endpoint — the shipped updatePackage() call reads only the patched document, the package name and the transport request. Kept for compatibility with CreatePackage/ValidatePackage, which do read it.',
+      },
+      updated_description: {
+        type: 'string',
+        description: 'New description for the package.',
+      },
+      transport_request: {
+        type: 'string',
+        description:
+          'Transport request number (required for transportable packages), not a task.',
+      },
+      lock_handle: {
+        type: 'string',
+        description:
+          'Lock handle from LockObject. Required for update operation.',
+      },
+      session_id: {
+        type: 'string',
+        description:
+          'Session ID from GetSession. If not provided, a new session will be created.',
+      },
+      session_state: {
+        type: 'object',
+        description:
+          'Session state from GetSession (cookies, csrf_token, cookie_store). Required if session_id is provided.',
+        properties: {
+          cookies: { type: 'string' },
+          csrf_token: { type: 'string' },
+          cookie_store: { type: 'object' },
+        },
+      },
+    },
+    required: [
+      'package_name',
+      'super_package',
+      'updated_description',
+      'lock_handle',
+    ],
+  },
+} as const;
+
+interface UpdatePackageArgs {
+  package_name: string;
+  super_package: string;
+  updated_description: string;
+  lock_handle: string;
+  transport_request?: string;
+  session_id?: string;
+  session_state?: {
+    cookies?: string;
+    csrf_token?: string;
+    cookie_store?: Record<string, string>;
+  };
+}
+
+export async function handleUpdatePackage(
+  context: HandlerContext,
+  args: UpdatePackageArgs,
+) {
+  const { connection, logger } = context;
+  try {
+    const {
+      package_name,
+      super_package,
+      updated_description,
+      lock_handle,
+      transport_request,
+      session_id,
+      session_state,
+    } = args as UpdatePackageArgs;
+
+    if (
+      !package_name ||
+      !super_package ||
+      !updated_description ||
+      !lock_handle
+    ) {
+      return return_error(
+        new Error(
+          'package_name, super_package, updated_description, and lock_handle are required',
+        ),
+      );
+    }
+
+    // The lock lives in a session of its own (LockPackageLow); the update has
+    // to run in that session, where the handle is valid.
+    const client = createAdtClient(
+      connectionHoldingPackageLock(connection, lock_handle),
+      logger,
+    );
+    const packageName = package_name.toUpperCase();
+
+    logger?.info(`Starting package update: ${packageName}`);
+
+    if (session_id && session_state) {
+      await restoreSessionInConnection(connection, session_id, session_state);
+    }
+
+    try {
+      // The three steps, in the handler because 19 put them there. `analyse`
+      // on each one: a refusal from the read and a refusal from the write are
+      // different failures, and whichever comes back is the one the caller
+      // sees, built by the strategy rather than summarised here.
+      const written = await sequence(
+        () =>
+          client
+            .getPackage()
+            .readMetadata({ packageName }, { analyse: analyseException }),
+        (current) =>
+          client.getPackage().updateMetadata(
+            {
+              packageName,
+              ...(transport_request && {
+                transportRequest: transport_request,
+              }),
+            },
+            {
+              source: patchPackageXml(
+                extractXmlString(current, `package ${packageName}`),
+                { description: updated_description },
+              ),
+              lockHandle: lock_handle,
+              analyse: analyseException,
+            },
+          ),
+      );
+
+      // A refusal goes out through `answer()`, with what SAP said (T100,
+      // exception type, raw body). It used to be flattened to the transport's
+      // own "Request failed with status code 400", which named no reason.
+      if (!written.ok) {
+        logger?.error(`UpdatePackage refused: ${written.getError().message}`);
+        return answer(
+          { tool: 'UpdatePackageLow', detail: 'terse' },
+          async () => written,
+          () => undefined,
+        );
+      }
+
+      logger?.info(`✅ UpdatePackage completed: ${packageName}`);
+
+      return return_response({
+        data: JSON.stringify(
+          {
+            success: true,
+            package_name: packageName,
+            super_package: super_package.toUpperCase(),
+            updated_description,
+            session_id: session_id || null,
+            session_state: null, // Session state management is now handled by auth-broker,
+            message: `Package ${packageName} updated successfully. Remember to unlock using UnlockObject.`,
+          },
+          null,
+          2,
+        ),
+      } as AxiosResponse);
+    } catch (error: any) {
+      // `sequence()`'s two calls each carry their own `analyse` and never
+      // throw for a refusal — `written.ok`/`written.getError()` above is
+      // where that verdict is read, per this file's own top comment. This
+      // catch is left for a genuine bug in this block (`patchPackageXml`,
+      // say), not for a wire refusal, so it no longer guesses an HTTP
+      // status or re-parses an `exc` namespace `exception` element out of a body no v19 call here
+      // can still produce — that read belongs to `analyseException`, not a
+      // second opinion here (issue #200-adjacent; found while writing the
+      // handler invariant that checks for exactly this).
+      const message = error?.message ?? String(error);
+      logger?.error(`Error updating package ${packageName}: ${message}`);
+      return return_error(new Error(`Failed to update package: ${message}`));
+    }
+  } catch (error: any) {
+    return return_error(error);
+  }
+}

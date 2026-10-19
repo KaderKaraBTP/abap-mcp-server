@@ -1,0 +1,75 @@
+_schema-version: "3.1"
+ID: abap-mcp-server
+version: 18.1.0
+description: >-
+  MCP ABAP ADT server as a remote (streamable HTTP) MCP server on SAP BTP
+  Cloud Foundry. SAP systems are BTP destinations; on-premise ones are reached
+  through the Connectivity service and the Cloud Connector.
+
+parameters:
+  enable-parallel-deployments: true
+
+modules:
+  - name: abap-mcp-server
+    type: nodejs
+    path: btp
+    build-parameters:
+      builder: custom
+      # Compiles lib + core from this checkout, packs them into btp/vendor and
+      # compiles btp/src. CF then installs exactly this code.
+      commands:
+        - node scripts/build.mjs
+      ignore:
+        - node_modules/
+        - src/
+        - scripts/
+        - tsconfig.json
+        - package-lock.json
+    parameters:
+      buildpack: nodejs_buildpack
+      memory: 1024M
+      disk-quota: 1024M
+      command: node dist/index.js
+      health-check-type: http
+      health-check-http-endpoint: /mcp/health
+      # Route: https://<org>-<space>-abap-mcp-server.cfapps.ca10.hana.ondemand.com
+    properties:
+      NODE_ENV: production
+      # The BTP destination used when a request names none. Change to yours.
+      SAP_DESTINATION: S4H_ADT
+      # Let a client pick another destination with the x-mcp-destination header.
+      MCP_ALLOW_DESTINATION_HEADER: "true"
+      # Optional allowlist of destination names (comma-separated); empty = any.
+      MCP_ALLOWED_DESTINATIONS: ""
+      # Tool groups: readonly, high, low, debug (comma-separated).
+      MCP_EXPOSITION: readonly,high
+      SAP_SYSTEM_TYPE: onprem
+      MCP_PATH: /mcp
+      MCP_SCOPE: MCPUser
+    requires:
+      - name: abap-mcp-xsuaa
+      - name: abap-mcp-destination
+      - name: abap-mcp-connectivity
+
+resources:
+  - name: abap-mcp-xsuaa
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+      config:
+        xsappname: abap-mcp-server-${space}
+        tenant-mode: dedicated
+
+  - name: abap-mcp-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+
+  - name: abap-mcp-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite

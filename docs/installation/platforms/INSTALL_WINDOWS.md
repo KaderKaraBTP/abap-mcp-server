@@ -1,0 +1,459 @@
+# Windows Installation Guide
+
+Complete guide for installing MCP ABAP ADT Server on Windows using PowerShell and winget.
+
+## 📋 Prerequisites
+
+- Windows 10/11
+- Node.js 22 or 24
+- PowerShell 5.1 or later
+- Administrator access (for winget installations)
+
+## 🔧 Step 1: Install Node.js
+
+### Option 1: Using nvm-windows (Recommended)
+
+nvm (Node Version Manager) allows you to install and switch between multiple Node.js versions.
+
+1. **Install nvm-windows:**
+
+```powershell
+# Using winget
+winget install CoreyButler.NVMforWindows
+
+# Or download installer from:
+# https://github.com/coreybutler/nvm-windows/releases
+```
+
+2. **Restart PowerShell as Administrator**
+
+3. **Install Node.js 24 (or 22):**
+
+```powershell
+nvm install 24
+
+# Use the installed version
+nvm use 24
+
+# Verify installation
+node -v
+npm -v
+```
+
+### Option 2: Using winget (Direct)
+
+```powershell
+# Install Node.js LTS directly
+winget install OpenJS.NodeJS.LTS
+
+# Verify installation
+node -v
+npm -v
+```
+
+### Option 3: Manual Installation
+
+1. Download Node.js LTS from [nodejs.org](https://nodejs.org/)
+2. Run the installer
+3. Restart PowerShell
+4. Verify:
+   ```powershell
+   node -v
+   npm -v
+   ```
+
+## 📦 Step 2: Install Git (only to build from source)
+
+### Using winget
+
+```powershell
+winget install Git.Git
+
+# Restart PowerShell, then verify
+git --version
+```
+
+### Manual Installation
+
+Download from [git-scm.com](https://git-scm.com/download/win)
+
+## 🚀 Step 3: Install MCP ABAP ADT Server
+
+### Option A: Install from npm (Recommended)
+
+```powershell
+npm install -g @mcp-abap-adt/core
+
+# Verify installation
+mcp-abap-adt --help
+```
+
+`@mcp-abap-adt/compact` (command `mcp-abap-adt-compact`) is the alternative compact server; it takes
+the same configuration. See [Installation variants](../INSTALLATION.md#installation-variants).
+
+**Available commands after installation:**
+- `mcp-abap-adt` - stdio transport (default)
+- `mcp-abap-adt --transport=stdio` - stdio transport (for MCP clients)
+- `mcp-abap-adt --transport=http` - HTTP server transport
+- `mcp-abap-adt --transport=sse` - SSE server transport
+
+**Usage examples:**
+```powershell
+# HTTP server on default port (3000)
+mcp-abap-adt --transport=http
+
+# HTTP server on custom port
+mcp-abap-adt --transport=http --port=8080
+
+# SSE server accessible from network
+mcp-abap-adt --transport=sse --host=0.0.0.0 --port=3000
+
+# Use a custom .env file
+mcp-abap-adt --transport=http --env-path=C:\path\to\custom\.env --port=8080
+```
+
+**Troubleshooting:**
+
+If command not found after global installation:
+```powershell
+# Check npm global bin directory
+npm config get prefix
+
+# Add to PATH (PowerShell as Administrator)
+$npmPrefix = npm config get prefix
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";$npmPrefix", "User")
+
+# Restart PowerShell for changes to take effect
+```
+
+### Option B: Build from Source (For Development)
+
+```powershell
+git clone https://github.com/fr0ster/mcp-abap-adt.git
+cd mcp-abap-adt
+npm install
+npm run build
+```
+
+The checkout is not runnable as a server by itself; to run what you built, see
+[From source (development)](../INSTALLATION.md#from-source-development).
+
+### RFC and SNC
+
+RFC and SNC need, **before** `npm install -g`: the SAP NW RFC SDK, a C++ toolchain, and
+`SAPNWRFC_HOME` set in the shell that runs the install.
+
+- **Toolchain:** Visual Studio Build Tools with the "Desktop development with C++" workload, and
+  Python 3 — e.g. `winget install Microsoft.VisualStudio.2022.BuildTools`, then add the workload in
+  the installer; `winget install Python.Python.3.12`.
+- **Runtime:** `%SAPNWRFC_HOME%\lib` on `PATH` of the server process.
+- **SNC:** SAP Secure Login Client logged on; the SNC library is found via the registry.
+
+```powershell
+$env:SAPNWRFC_HOME = "C:\nwrfcsdk\nwrfcsdk"
+$env:PATH = "$env:SAPNWRFC_HOME\lib;$env:PATH"
+npm install -g @mcp-abap-adt/core
+npm ls -g @mcp-abap-adt/sap-rfc-lite
+```
+
+`(empty)` from `npm ls` means npm silently dropped the RFC module. Details and the SNC `.env`:
+[RFC Setup](../RFC_SETUP.md).
+
+## ⚙️ Step 4: Configure SAP Connection
+
+Create a `.env` file anywhere (the server reads nothing from the working directory) and start the
+server with `--env-path=<file>`:
+
+```powershell
+# Create .env file
+@"
+SAP_URL=https://your-sap-system.example:8000
+SAP_CLIENT=100
+SAP_LANGUAGE=en
+SAP_AUTH_TYPE=basic
+SAP_USERNAME=your_username
+SAP_PASSWORD=your_password
+"@ | Out-File -FilePath C:\path\to\your\your-system.env -Encoding utf8
+
+mcp-abap-adt --env-path=C:\path\to\your\your-system.env
+```
+
+> **No `SAP_TIMEOUT_DEFAULT` here on purpose.** The sample used to set it to
+> `45000`, and copying that arms a 45-second deadline on every ADT request the
+> server is still working on. `@mcp-abap-adt/adt-clients` removed that default
+> for a measured reason: an aborted `POST /deletion/delete` was retried into a
+> *new* session, while the ABAP session underneath kept the enqueue locks — the
+> lock handle dead, the lock alive and unreachable, the object left locked and
+> inactive. Leave the variable unset and requests run without a client-side
+> deadline; set it only when you have a specific reason to cut one short, and
+> expect that cost.
+
+## 🔌 Step 5: Connect to AI Tools
+
+### Server Modes
+
+MCP ABAP ADT Server supports two transport protocols:
+
+1. **stdio** (default) - Standard input/output, used by Cline/Cursor (requires .env file)
+2. **http** - HTTP StreamableHTTP transport (requires `--transport=http`), works without .env file
+2. **SSE/HTTP** - Server-Sent Events over HTTP, for web interfaces
+
+### Cline (VS Code Extension)
+
+Uses **stdio** mode (must be explicitly specified).
+
+**⚠️ IMPORTANT:** After global installation (`npm install -g @mcp-abap-adt/core`), use the `mcp-abap-adt` command with `--transport=stdio` and `--env` arguments.
+
+1. Install Cline extension in VS Code
+2. Open Cline settings (JSON): `Ctrl+Shift+P` → "Preferences: Open User Settings (JSON)"
+3. Add MCP server configuration:
+
+**For globally installed package (recommended):**
+
+```json
+{
+  "mcpServers": {
+    "mcp-abap-adt": {
+      "command": "mcp-abap-adt",
+      "args": [
+        "--transport=stdio",
+        "--env=C:\\path\\to\\your\\your-system.env"
+      ]
+    }
+  }
+}
+```
+
+**Important notes for Windows:**
+- Use double backslashes `\\` or forward slashes `/` in file paths
+- `--transport=stdio` is the default; HTTP/SSE require `--transport=http`/`--transport=sse`
+- Name the env file with `--env` (or `--env-path`, or use `--mcp=<name>`): nothing is looked up in the
+  working directory, so a `.env` there is read only when named (`--env-path=./.env`)
+
+**Alternative: Using node with full path (if global command not in PATH):**
+
+```json
+{
+  "mcpServers": {
+    "mcp-abap-adt": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\YourUsername\\AppData\\Roaming\\npm\\node_modules\\@mcp-abap-adt\\core\\bin\\mcp-abap-adt.js",
+        "--transport=stdio",
+        "--env=C:\\path\\to\\your\\your-system.env"
+      ]
+    }
+  }
+}
+```
+
+### Cursor
+
+Uses **stdio** mode (must be explicitly specified).
+
+**⚠️ IMPORTANT:** After global installation, use the `mcp-abap-adt` command with `--transport=stdio` and `--env` arguments.
+
+Add to Cursor settings:
+
+```json
+{
+  "mcpServers": {
+    "mcp-abap-adt": {
+      "command": "mcp-abap-adt",
+      "args": [
+        "--transport=stdio",
+        "--env=C:\\path\\to\\your\\your-system.env"
+      ]
+    }
+  }
+}
+```
+
+**Note:** The `--env` argument is required: the server reads no `.env` it was not given.
+
+### HTTP Mode (Streamable HTTP)
+
+**⚠️ IMPORTANT:** HTTP mode requires `--transport=http` (the default transport is stdio). No `.env` file is required for HTTP mode (connection can be configured via HTTP headers).
+
+**Starting HTTP Server:**
+
+```powershell
+# Start server in HTTP mode (requires --transport=http)
+mcp-abap-adt --transport=http
+
+# Or explicitly specify HTTP mode
+mcp-abap-adt --transport=streamable-http
+
+# Or with custom port
+mcp-abap-adt --transport=streamable-http --port=8080
+```
+
+**HTTP Server Options:**
+- `--transport=streamable-http` or `--transport=http` - Use HTTP transport (stdio is the default)
+- `--host=<host>` - Server host (default: 127.0.0.1; use 0.0.0.0 for all interfaces)
+- `--port=<port>` - Server port (default: 3000 for http)
+- `--path=<path>` (alias `--http-path=<path>`) - HTTP endpoint path (default: /mcp/stream/http)
+- `--http-allowed-hosts=<list>` - Comma-separated exact Host header values for DNS-rebinding protection (includes port, e.g. `localhost:3000`)
+- `--http-allowed-origins=<list>` - Comma-separated exact Origin header values for DNS-rebinding protection (includes scheme, e.g. `https://app.example.com`)
+- `--http-enable-dns-protection` - Enable Host/Origin allowlist validation (NOT browser CORS — no Access-Control-Allow-Origin headers are emitted); non-allowlisted Host/Origin → HTTP 403
+
+**Example with custom port:**
+```powershell
+mcp-abap-adt --transport=streamable-http --port=8080
+```
+
+Server will be available at: `http://localhost:8080/mcp/stream/http`
+
+**Configuration for HTTP clients:**
+
+```json
+{
+  "local-mcp-http": {
+    "disabled": false,
+    "timeout": 60,
+    "type": "streamableHttp",
+    "url": "http://localhost:3000/mcp/stream/http",
+    "headers": {
+      "x-sap-url": "https://your-sap-system.example:8000",
+      "x-sap-login": "your_username",
+      "x-sap-password": "your_password",
+      "x-sap-client": "100"
+    }
+  }
+}
+```
+
+**⚠️ NOTE:** For HTTP mode, you can configure SAP connection via HTTP headers (as shown above) OR use `.env` file:
+
+```powershell
+# Using .env file with HTTP mode
+mcp-abap-adt --transport=streamable-http --env=C:\\path\\to\\your\\your-system.env
+```
+
+### SSE Mode (Server-Sent Events)
+
+**⚠️ IMPORTANT:** SSE mode requires `.env` file or HTTP headers for SAP connection configuration.
+
+**Starting SSE Server:**
+
+```powershell
+# Start server in SSE mode (requires .env file)
+mcp-abap-adt --transport=sse --env=C:\\path\\to\\your\\your-system.env
+
+# Or with custom port
+mcp-abap-adt --transport=sse --port=3001 --env=C:\\path\\to\\your\\your-system.env
+```
+
+**SSE Server Options:**
+- `--transport=sse` - Use SSE transport
+- `--host=<host>` - Server host (default: 127.0.0.1; use 0.0.0.0 for all interfaces)
+- `--port=<port>` - Server port (default: 3001 for sse)
+- `--sse-path=<path>` - SSE connection path (default: /sse)
+- `--post-path=<path>` - SSE message post path (default: /messages)
+- `--env=PATH` - Path to `.env` file (required for SSE mode)
+- `--sse-allowed-hosts=<list>` - Comma-separated exact Host header values for DNS-rebinding protection (includes port, e.g. `localhost:3001`)
+- `--sse-allowed-origins=<list>` - Comma-separated exact Origin header values for DNS-rebinding protection (includes scheme, e.g. `https://app.example.com`)
+- `--sse-enable-dns-protection` - Enable Host/Origin allowlist validation (NOT browser CORS — no Access-Control-Allow-Origin headers are emitted); non-allowlisted Host/Origin → HTTP 403
+
+**Example with custom port and host:**
+```powershell
+mcp-abap-adt --transport=sse --port=4100 --host=127.0.0.1 --env=C:\\path\\to\\your\\your-system.env
+```
+
+Server will be available at: `http://127.0.0.1:4100/sse`
+
+**Configuration for SSE clients:**
+
+```json
+{
+  "local-mcp-sse": {
+    "disabled": false,
+    "timeout": 60,
+    "type": "sse",
+    "url": "http://localhost:3001/sse"
+  }
+}
+```
+
+**⚠️ NOTE:** SSE mode requires `.env` file to be specified. The server will not start without it.
+
+## ✅ Step 6: Test Installation
+
+```powershell
+mcp-abap-adt --help
+
+# In a source checkout: run the unit tests
+npm test
+```
+
+## 🐛 Troubleshooting
+
+### Node.js not found after installation
+
+Restart PowerShell or add to PATH manually:
+
+```powershell
+$env:Path += ";C:\Program Files\nodejs"
+```
+
+### Permission errors during npm install
+
+Run PowerShell as Administrator, or point npm at a user-level prefix and add it to `PATH`:
+
+```powershell
+npm config set prefix "$env:APPDATA\npm"
+```
+
+### SSL/TLS certificate errors
+
+From 17.0.0 the server verifies the HTTPS certificate of the SAP system. For a self-signed or
+company-CA certificate, trust the CA in the environment of the server process (the MCP client's
+`env` block, or the shell that starts the server):
+
+```powershell
+$env:NODE_EXTRA_CA_CERTS = "C:\path\to\ca.pem"
+```
+
+Opting out is `TLS_REJECT_UNAUTHORIZED=0` in that same process environment — only on a trusted
+network. A destination's `.env` is not read for either. See [Migrating to 17.0.0](../../MIGRATION-17.0.md).
+
+### Firewall blocking connection
+
+Add exception in Windows Firewall:
+
+```powershell
+# Run as Administrator
+New-NetFirewallRule -DisplayName "Node.js" -Direction Outbound -Program "C:\Program Files\nodejs\node.exe" -Action Allow
+```
+
+## 📚 Next Steps
+
+- [Configure SAP Connection](../../user-guide/CLIENT_CONFIGURATION.md)
+- [Review CLI Options](../../user-guide/CLI_OPTIONS.md)
+
+## 💡 Tips for Windows
+
+### Use Windows Terminal
+
+Install for better PowerShell experience:
+
+```powershell
+winget install Microsoft.WindowsTerminal
+```
+
+### Set Execution Policy
+
+If scripts are blocked:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+### Use PowerShell 7
+
+For better performance:
+
+```powershell
+winget install Microsoft.PowerShell
+```
+- [Available Tools](../../user-guide/AVAILABLE_TOOLS.md)

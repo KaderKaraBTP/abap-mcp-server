@@ -1,0 +1,290 @@
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnOptionsForNpx } from '../helpers/platform';
+
+/**
+ * The tool surface is a contract with callers who never read this repository.
+ *
+ * `detail` is the one addition the adt-clients 19 migration may make; anything
+ * else moving is a regression, and this is where it is caught.
+ *
+ * `scripts/list-tools.ts` answers a FLAT ARRAY of
+ * `{ group, name, inputs, available_in }`, where `inputs` is a formatted
+ * string — `"table_name*, max_rows"`, with `*` marking required and the
+ * sentinel `"(none)"` for a tool that takes nothing — and `available_in` is
+ * a sorted, comma-joined list of SAP environments, or the sentinel
+ * `"(everywhere)"` for a tool that declares none. Not an object keyed by
+ * group, and not a `params` array: a test written against either would fail
+ * on an unchanged surface and the ratchet would be useless from the first
+ * task onward.
+ *
+ * **`available_in` is checked here too, and was not always.** The parameter
+ * comparison below only ever read `inputs` — a tool that gained or lost an
+ * environment passed it silently, unless a `legacyExposure`/`legacyThrows`
+ * ledger elsewhere happened to name that exact tool. Two earlier tasks
+ * recorded the gap without closing it; this file is the ratchet, so this is
+ * where it closes: a changed `available_in`, in either direction, fails the
+ * same way an added or removed parameter does.
+ */
+describe('the MCP tool surface', () => {
+  type Row = {
+    group: string;
+    name: string;
+    inputs: string;
+    available_in: string;
+  };
+
+  const read = (rows: Row[]) =>
+    new Map(rows.map((r) => [`${r.group}/${r.name}`, r.inputs]));
+  const availability = (rows: Row[]) =>
+    new Map(rows.map((r) => [`${r.group}/${r.name}`, r.available_in]));
+  const parameters = (inputs: string) =>
+    inputs === '(none)' ? [] : inputs.split(', ');
+
+  const frozen: Row[] = JSON.parse(
+    readFileSync(
+      join(__dirname, '../../../tests/fixtures/tools/surface.json'),
+      'utf8',
+    ),
+  );
+
+  const current: Row[] = JSON.parse(
+    execFileSync('npx', ['tsx', 'scripts/list-tools.ts'], {
+      ...spawnOptionsForNpx,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+    }),
+  );
+
+  it('enumerates the whole surface, so the assertions below are not vacuous', () => {
+    // A run that listed nothing would satisfy every comparison that follows.
+    expect(frozen.length).toBeGreaterThan(300);
+    expect(current.length).toBe(frozen.length);
+  });
+
+  it('has the same tools in the same groups', () => {
+    expect([...read(current).keys()].sort()).toEqual(
+      [...read(frozen).keys()].sort(),
+    );
+  });
+
+  it('changes no parameter except by adding detail', () => {
+    const now = read(current);
+    for (const [tool, before] of read(frozen)) {
+      const after = now.get(tool);
+      if (after === before) continue;
+
+      const had = parameters(before);
+      const has = parameters(after ?? '(none)');
+
+      // Nothing may leave, and what may arrive is `detail` — optional, so it
+      // carries no `*` — or, on the two DDLX check tools, `version`.
+      //
+      // **Why that second exception exists.** The DDLX checkruns endpoint
+      // does not fall back to the version that exists: an activated
+      // extension answers `notProcessed` when asked for `inactive`, which is
+      // what the shipped default asked for, so from these two tools an
+      // activated extension could not be checked at all (#178, eseuve). A
+      // parameter was the only way to say which one — measured on trial and
+      // captured in `check-ddlx-active-version` /
+      // `check-ddlx-inactive-version`.
+      //
+      // **Third exception: three compact runtime tools closed real coverage
+      // gaps against the readonly surface.** `HandlerProfileRun` could only
+      // ever run WITH profiling (`handleRuntimeRunClassWithProfiling`/
+      // `handleRuntimeRunProgramWithProfiling`) — a plain run
+      // (`handleRuntimeRunClass`/`handleRuntimeRunProgram`) was unreachable
+      // from compact mode, so `profiling` (default true) was added.
+      // `HandlerProfileView` only ever returned the raw trace payload
+      // (`handleRuntimeGetProfilerTraceData`) — the dedicated analysis
+      // endpoint (`handleRuntimeAnalyzeProfilerTrace`, totals + top-ranked
+      // entries) had no compact tool at all, so `mode` (raw|analyze, default
+      // raw) and `top` (analyze's row limit) were added. `HandlerDumpList`
+      // hardcoded `feed_type: 'dumps'` into `handleRuntimeListFeeds`, which
+      // also serves `system_messages` and `gateway_errors` — two more feed
+      // types compact could not reach — so `feed_type` (default 'dumps') was
+      // added instead of new tool names.
+      //
+      // **Fourth exception: `CreateTransportTask` gained `task_type`.** A task
+      // `newtask` creates is Unclassified, and on premise the first
+      // `addobject` onto it is refused (`SCTS_ADT_MSG 009` / TK127, measured
+      // on premise 2026-09-25) until `changetasktype` gives it a type. The tool
+      // now types the task itself, `S` by default; the parameter is how a
+      // caller asks for Repair (`R`) or leaves it Unclassified (`X`).
+      //
+      // **Sixth exception: six check tools gained `version`** — CheckDomain,
+      // CheckDataElement, CheckBehaviorDefinition, CheckProgram,
+      // CheckFunctionGroup and CheckInterface.
+      // They could only ask about the inactive version, and an object that
+      // is only active has none: SAP answered "Error while importing object
+      // … from the database" for the shared domain and data element (an on-premise system,
+      // 2026-09-25). Every other DDIC check already took a version.
+      //
+      // **Fifth exception: seven low-tier writes gained `transport_request`.**
+      // They had none, so a caller's request number was dropped and the write
+      // went out without `corrNr` — refused on premise with "Parameter corrNr
+      // could not be found." (SADT_RESOURCE 017, on premise 2026-09-25). Every other
+      // low-tier write already carried it.
+      // **One relaxation, and it is a relaxation rather than a loss.**
+      // `CheckPackage`/`CheckPackageLow` required `super_package` and never sent
+      // it: the guard refused the call before any request, so a package with no
+      // parent — `super_package: ""`, which is what a top-level package has —
+      // could not be checked at all. Measured on a BTP trial 2026-09-28: the
+      // suite's own `ZMCP_SHR_PKG` answered `isError: true` with nothing on the
+      // wire while the other nine check tools passed. The parameter is still
+      // accepted, so no caller's request becomes invalid; it only stopped being
+      // mandatory. `super_package*` therefore leaves and `super_package`
+      // arrives, which is this one pair and nothing else.
+      const MAY_RELAX_REQUIRED: Record<string, string> = {
+        'high/CheckPackage': 'super_package',
+        'low/CheckPackageLow': 'super_package',
+      };
+      const relaxed = MAY_RELAX_REQUIRED[tool];
+      // **One tightening, decided by the user (2026-10-11).** The two ABAP
+      // debugger starts require at least one breakpoint (`minItems: 1`), as the
+      // compact start already did: a model may start a run and forget the
+      // breakpoints, and a listener with none of its own catches nothing it
+      // asked for. `breakpoints` leaves and `breakpoints*` arrives, which is this
+      // one pair per tool and nothing else. It lands in the 18.0.0 major.
+      const MAY_TIGHTEN_REQUIRED: Record<string, string> = {
+        'debug/DebugStartListener': 'breakpoints',
+        'debug/DebugTakeOverListener': 'breakpoints',
+      };
+      const tightened = MAY_TIGHTEN_REQUIRED[tool];
+      expect({
+        tool,
+        lost: had.filter(
+          (p) =>
+            !has.includes(p) &&
+            p !== `${relaxed ?? '\u0000'}*` &&
+            p !== tightened,
+        ),
+      }).toEqual({
+        tool,
+        lost: [],
+      });
+      const MAY_GAIN_VERSION = new Set([
+        'high/CheckMetadataExtension',
+        'low/CheckMetadataExtensionLow',
+      ]);
+      const EXTRA_ALLOWED_ADDITIONS: Record<string, string[]> = {
+        'compact/HandlerProfileRun': ['profiling'],
+        'compact/HandlerProfileView': ['mode', 'top'],
+        'compact/HandlerDumpList': ['feed_type'],
+        // Issue #261: the dumps feed filters on the attributes its descriptor
+        // declares; the user filter was the only one reachable before.
+        'system/RuntimeListFeeds': [
+          'runtime_error',
+          'exception',
+          'object_name',
+          'package',
+          'component',
+        ],
+        'high/CreateTransportTask': ['task_type'],
+        'low/UpdateClassLow': ['transport_request'],
+        'low/UpdateClassTestClassesLow': ['transport_request'],
+        'low/UpdateDdlLow': ['transport_request'],
+        'low/UpdateMetadataExtensionLow': ['transport_request'],
+        'low/UpdateInterfaceLow': ['transport_request'],
+        'low/UpdateStructureLow': ['transport_request'],
+        'low/UpdateProgramLow': ['transport_request'],
+        'high/CheckDomain': ['version'],
+        'low/CheckDomainLow': ['version'],
+        'high/CheckDataElement': ['version'],
+        'low/CheckDataElementLow': ['version'],
+        'high/CheckBehaviorDefinition': ['version'],
+        'low/CheckBdefLow': ['version'],
+        'high/CheckProgram': ['version'],
+        'low/CheckProgramLow': ['version'],
+        'high/CheckFunctionGroup': ['version'],
+        'low/CheckFunctionGroupLow': ['version'],
+        'high/CheckInterface': ['version'],
+        'low/CheckInterfaceLow': ['version'],
+        // The eighth of the same family, found while reviewing the other
+        // seven: `core/package/update.ts` appends `&corrNr=` when a transport
+        // is given and `IPackageConfig` declares `transportRequest`, but the
+        // schema never offered one — so a transportable package could not be
+        // updated through this tool at all.
+        'low/UpdatePackageLow': ['transport_request'],
+        // adt-clients 29 (fr0ster/mcp-abap-adt-clients#217): the two ABAP debugger
+        // starts take whose requests are caught, the debugging mode and the
+        // debugger settings. All three optional.
+        'debug/DebugStartListener': [
+          'request_user',
+          'debugging_mode',
+          'settings',
+        ],
+        'debug/DebugTakeOverListener': [
+          'request_user',
+          'debugging_mode',
+          'settings',
+        ],
+      };
+      expect({
+        tool,
+        added: has.filter(
+          (p) => !had.includes(p) && p !== relaxed && p !== `${tightened}*`,
+        ),
+      }).toEqual({
+        tool,
+        added: MAY_GAIN_VERSION.has(tool)
+          ? ['version']
+          : relaxed !== undefined
+            ? []
+            : (EXTRA_ALLOWED_ADDITIONS[tool] ?? ['detail']),
+      });
+    }
+  });
+
+  /**
+   * The snapshot moved once, deliberately, and this is what it moved by.
+   *
+   * Every tool that declared `legacy` stopped: support for legacy systems
+   * (BASIS < 7.50) is parked on `parked/legacy-support` until it can be tried
+   * against a live one. Nothing in this repository ever was — the environment
+   * was declared on 142 tools, and `available_in` naming an environment
+   * nobody had verified is a claim rather than a fact.
+   *
+   * The refreeze was checked rather than trusted: `inputs` had to match the
+   * old snapshot row for row, and each `available_in` had to equal the old
+   * one with `legacy` removed and nothing else. A tool that had quietly
+   * gained or lost anything else would have stopped the refreeze.
+   */
+  /**
+   * The second deliberate move: three tools arrived.
+   *
+   * ATC was in `@mcp-abap-adt/adt-clients` 19 and exposed by nothing here —
+   * `AdtRuntimeClient.getAtc()` with the variant, the worklist, the run, its
+   * status and its findings, and no `src/handlers/atc` to reach them. The
+   * refreeze was checked rather than trusted: every existing row had to match
+   * the old snapshot exactly, in `inputs` and in `available_in`, and the only
+   * difference allowed was these three names appearing. A tool that had
+   * quietly gained or lost anything else would have stopped it.
+   */
+  /**
+   * **The third deliberate move: `DebugSetSettings` arrived** with the debugger
+   * on adt-clients 29 — the settings at the current stop. Every other row was
+   * checked unchanged.
+   */
+  it('adds tools only deliberately', () => {
+    const arrived = [...read(current).keys()].filter(
+      (tool) => !read(frozen).has(tool),
+    );
+    expect(arrived).toEqual([]);
+  });
+
+  it('no tool declares legacy', () => {
+    expect(current.filter((r) => /legacy/.test(r.available_in))).toEqual([]);
+  });
+
+  it('changes no tool availability', () => {
+    const now = availability(current);
+    for (const [tool, before] of availability(frozen)) {
+      expect({ tool, available_in: now.get(tool) }).toEqual({
+        tool,
+        available_in: before,
+      });
+    }
+  });
+});

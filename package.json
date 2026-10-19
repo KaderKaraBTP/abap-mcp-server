@@ -1,0 +1,307 @@
+{
+  "name": "@mcp-abap-adt/lib",
+  "version": "18.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./handlers": {
+      "types": "./dist/lib/handlers/index.d.ts",
+      "import": "./dist/lib/handlers/index.js",
+      "require": "./dist/lib/handlers/index.js"
+    },
+    "./utils": {
+      "types": "./dist/lib/utils.d.ts",
+      "import": "./dist/lib/utils.js",
+      "require": "./dist/lib/utils.js"
+    },
+    "./embeddable": {
+      "types": "./dist/embeddable/index.d.ts",
+      "import": "./dist/embeddable/index.js",
+      "require": "./dist/embeddable/index.js"
+    },
+    "./config": {
+      "types": "./dist/lib/config/index.d.ts",
+      "import": "./dist/lib/config/index.js",
+      "require": "./dist/lib/config/index.js"
+    },
+    "./auth": {
+      "types": "./dist/lib/auth/index.d.ts",
+      "import": "./dist/lib/auth/index.js",
+      "require": "./dist/lib/auth/index.js"
+    },
+    "./logger": {
+      "types": "./dist/lib/handlerLogger.d.ts",
+      "import": "./dist/lib/handlerLogger.js",
+      "require": "./dist/lib/handlerLogger.js"
+    },
+    "./request-context": {
+      "types": "./dist/lib/requestContext.d.ts",
+      "import": "./dist/lib/requestContext.js",
+      "require": "./dist/lib/requestContext.js"
+    },
+    "./handlers/read": {
+      "types": "./dist/lib/handlers/read.d.ts",
+      "import": "./dist/lib/handlers/read.js",
+      "require": "./dist/lib/handlers/read.js"
+    },
+    "./handlers/write": {
+      "types": "./dist/lib/handlers/write.d.ts",
+      "import": "./dist/lib/handlers/write.js",
+      "require": "./dist/lib/handlers/write.js"
+    },
+    "./compact-shared": {
+      "types": "./dist/lib/compact/index.d.ts",
+      "import": "./dist/lib/compact/index.js",
+      "require": "./dist/lib/compact/index.js"
+    },
+    "./debugger": {
+      "types": "./dist/lib/debugger/index.d.ts",
+      "import": "./dist/lib/debugger/index.js",
+      "require": "./dist/lib/debugger/index.js"
+    },
+    "./state": {
+      "types": "./dist/lib/state/index.d.ts",
+      "import": "./dist/lib/state/index.js",
+      "require": "./dist/lib/state/index.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "handlers": [
+        "dist/lib/handlers/index.d.ts"
+      ],
+      "utils": [
+        "dist/lib/utils.d.ts"
+      ],
+      "embeddable": [
+        "dist/embeddable/index.d.ts"
+      ],
+      "config": [
+        "dist/lib/config/index.d.ts"
+      ],
+      "auth": [
+        "dist/lib/auth/index.d.ts"
+      ],
+      "logger": [
+        "dist/lib/handlerLogger.d.ts"
+      ],
+      "request-context": [
+        "dist/lib/requestContext.d.ts"
+      ],
+      "handlers/read": [
+        "dist/lib/handlers/read.d.ts"
+      ],
+      "handlers/write": [
+        "dist/lib/handlers/write.d.ts"
+      ],
+      "compact-shared": [
+        "dist/lib/compact/index.d.ts"
+      ],
+      "debugger": [
+        "dist/lib/debugger/index.d.ts"
+      ],
+      "state": [
+        "dist/lib/state/index.d.ts"
+      ]
+    }
+  },
+  "scripts": {
+    "test:init": "node -e \"const fs=require('fs'),s='tests/test-config.yaml',t=s+'.template';if(fs.existsSync(s)){console.log(s+' already exists, skipping (use test:reinit to overwrite)')}else{fs.copyFileSync(t,s);console.log('Created '+s+' — edit lines marked CHANGE')}\"",
+    "test:reinit": "node -e \"const fs=require('fs'),s='tests/test-config.yaml',t=s+'.template';fs.copyFileSync(t,s);console.log('Recreated '+s+' from template')\"",
+    "test": "jest --passWithNoTests",
+    "test:integration": "jest --testPathPatterns=integration --testPathIgnorePatterns='__tests__/admin/' --runInBand --passWithNoTests --forceExit",
+    "test:high": "jest --testPathPatterns='integration.*High' --testPathIgnorePatterns='__tests__/admin/' --runInBand --passWithNoTests --forceExit",
+    "test:low": "jest --testPathPatterns='integration.*Low' --testPathIgnorePatterns='__tests__/admin/' --runInBand --passWithNoTests --forceExit",
+    "test:check": "npx tsc --noEmit -p tsconfig.test.json",
+    "shared:setup": "jest --testPathPatterns='admin/shared-deps/setup' --testPathIgnorePatterns='[]' --runInBand --passWithNoTests",
+    "shared:teardown": "jest --testPathPatterns='admin/shared-deps/teardown' --testPathIgnorePatterns='[]' --runInBand --passWithNoTests",
+    "shared:check": "jest --testPathPatterns='admin/shared-deps/check' --testPathIgnorePatterns='[]' --passWithNoTests",
+    "polygon:backup": "adt-backup backup --package ZMCP_SHR_PKG --env-path trial.env --output tests/fixtures/polygon.backup.yaml",
+    "lint": "npx biome check --write src",
+    "lint:check": "npx biome check src",
+    "format": "npx biome format --write src",
+    "prebuild": "node -e \"const fs=require('node:fs');for(const d of ['dist','server/dist','compact-readonly/dist','compact-modify/dist','compact/dist'])fs.rmSync(d,{recursive:true,force:true})\"",
+    "build": "npx biome check --write --diagnostic-level=error src && npx tsc -p tsconfig.json && npx tsc -p server/tsconfig.json && npx tsc -p compact-readonly/tsconfig.json && npx tsc -p compact-modify/tsconfig.json && npx tsc -p compact/tsconfig.json",
+    "build:fast": "npx tsc -p tsconfig.json",
+    "check-todos": "node tools/check-todos.js",
+    "auth": "npx sap-abap-auth auth",
+    "clean": "make clean",
+    "chrono": "./tools/version-stats.sh",
+    "docs:tools": "npm run build && node ./tools/generate-tools-docs.js",
+    "release:publish": "bash scripts/publish-all.sh",
+    "release:dry": "bash scripts/publish-all.sh --dry-run",
+    "prepublishOnly": "npm run build",
+    "portable:build": "node scripts/portable/build.mjs all",
+    "portable:build:full": "node scripts/portable/build.mjs full",
+    "portable:build:compact": "node scripts/portable/build.mjs compact",
+    "portable:smoke": "node scripts/portable/smoke.mjs",
+    "package": "npm pack",
+    "package:build": "npm run build && npm pack",
+    "prepare": "husky",
+    "smoke:mcp:crud": "node tools/mcp-crud-smoke.js",
+    "smoke:mcp:matrix": "node tools/mcp-crud-matrix.js",
+    "docker:build": "docker compose -f docker/docker-compose.yml build",
+    "docker:up": "docker compose -f docker/docker-compose.yml up -d",
+    "docker:down": "docker compose -f docker/docker-compose.yml down",
+    "docker:logs": "docker compose -f docker/docker-compose.yml logs -f",
+    "docker:build:headerless": "docker compose -f docker/docker-compose.headerless.yml build",
+    "docker:up:headerless": "docker compose -f docker/docker-compose.headerless.yml up -d",
+    "docker:down:headerless": "docker compose -f docker/docker-compose.headerless.yml down",
+    "btp:mtar": "node btp/scripts/mtar.mjs",
+    "btp:deploy": "cf deploy mta_archives/abap-mcp-server.mtar"
+  },
+  "keywords": [
+    "abap",
+    "sap",
+    "adt",
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "abap-cloud",
+    "sap-btp",
+    "xsuaa",
+    "jwt-auth",
+    "service-key",
+    "crud"
+  ],
+  "author": "Oleksii Kyslytsia <oleksij.kyslytsja@gmail.com>",
+  "description": "ADT tool handlers and an embeddable MCP server for SAP ABAP. The standalone server is @mcp-abap-adt/core.",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fr0ster/mcp-abap-adt.git"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@modelcontextprotocol/inspector": "^2.9.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.20.5",
+    "dotenv": "^18.0.5",
+    "esbuild": "^0.28.2",
+    "express": "^5.1.0",
+    "husky": "^9.1.7",
+    "jest": "^30.5.2",
+    "jest-util": "^30.5.1",
+    "lint-staged": "^16.4.0",
+    "postject": "^1.0.0-alpha.6",
+    "ts-jest": "^29.4.14",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "@mcp-abap-adt/adt-clients": "^30.0.0",
+    "@mcp-abap-adt/adt-strategies": "^0.10.2",
+    "@mcp-abap-adt/auth-broker": "^4.1.0",
+    "@mcp-abap-adt/auth-providers": "^5.4.0",
+    "@mcp-abap-adt/auth-stores": "^3.3.0",
+    "@mcp-abap-adt/connection": "^11.0.0",
+    "@mcp-abap-adt/interfaces-adt": "^15.3.0",
+    "@mcp-abap-adt/interfaces-adt-connection": "^2.0.0",
+    "@mcp-abap-adt/interfaces-auth": "^3.2.0",
+    "@mcp-abap-adt/interfaces-auth-broker": "^1.2.0",
+    "@mcp-abap-adt/interfaces-auth-sap": "^2.0.0",
+    "@mcp-abap-adt/interfaces-network": "^2.0.1",
+    "@mcp-abap-adt/interfaces-utils": "^1.1.1",
+    "@mcp-abap-adt/logger": "^0.4.1",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "axios": "^1.20.0",
+    "diff": "^9.0.0",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "fast-xml-parser": "^5.11.2",
+    "js-yaml": "^5.4.2",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
+    "zod": "^4.6.5"
+  },
+  "optionalDependencies": {
+    "@mcp-abap-adt/sap-rfc-lite": "^0.2.1"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=9.0.0"
+  },
+  "files": [
+    "dist/",
+    "docs/",
+    "!docs/superpowers/",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CONTRIBUTORS.md",
+    "CHANGELOG.md"
+  ],
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "roots": [
+      "<rootDir>/src",
+      "<rootDir>/compact-readonly/src",
+      "<rootDir>/compact-modify/src",
+      "<rootDir>/compact/src"
+    ],
+    "testMatch": [
+      "**/__tests__/**/*.test.ts"
+    ],
+    "transform": {
+      "^.+\\.ts$": [
+        "ts-jest",
+        {
+          "tsconfig": "tsconfig.test.json"
+        }
+      ]
+    },
+    "moduleFileExtensions": [
+      "ts",
+      "js",
+      "json"
+    ],
+    "moduleNameMapper": {
+      "^@mcp-abap-adt/lib$": "<rootDir>/src/index.ts",
+      "^@mcp-abap-adt/lib/handlers$": "<rootDir>/src/lib/handlers/index.ts",
+      "^@mcp-abap-adt/lib/handlers/read$": "<rootDir>/src/lib/handlers/read.ts",
+      "^@mcp-abap-adt/lib/handlers/write$": "<rootDir>/src/lib/handlers/write.ts",
+      "^@mcp-abap-adt/lib/compact-shared$": "<rootDir>/src/lib/compact/index.ts",
+      "^@mcp-abap-adt/lib/debugger$": "<rootDir>/src/lib/debugger/index.ts",
+      "^@mcp-abap-adt/lib/state$": "<rootDir>/src/lib/state/index.ts",
+      "^@mcp-abap-adt/lib/utils$": "<rootDir>/src/lib/utils.ts",
+      "^@mcp-abap-adt/lib/config$": "<rootDir>/src/lib/config/index.ts",
+      "^@mcp-abap-adt/compact-readonly$": "<rootDir>/compact-readonly/src/index.ts",
+      "^@mcp-abap-adt/compact-modify$": "<rootDir>/compact-modify/src/index.ts",
+      "^@mcp-abap-adt/core/launcher$": "<rootDir>/server/src/launcher.ts",
+      "^@mcp-abap-adt/compact-readonly/routes$": "<rootDir>/compact-readonly/src/handlers/compactReadRoutes.ts",
+      "^@mcp-abap-adt/compact-modify/routes$": "<rootDir>/compact-modify/src/handlers/compactWriteRoutes.ts",
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
+    "collectCoverageFrom": [
+      "src/**/*.ts",
+      "!src/**/*.test.ts",
+      "!src/**/__tests__/**",
+      "!src/**/index.ts"
+    ],
+    "testPathIgnorePatterns": [
+      "__tests__/admin/",
+      "__tests__/integration/"
+    ],
+    "maxWorkers": 1,
+    "testTimeout": 600000,
+    "globalSetup": "<rootDir>/src/__tests__/integration/globalSetup.ts",
+    "setupFilesAfterEnv": [
+      "<rootDir>/src/__tests__/integration/helpers/closeConnectionsAfterAll.ts"
+    ]
+  },
+  "lint-staged": {
+    "src/**/*.{ts,js}": [
+      "biome check --write"
+    ]
+  },
+  "private": false
+}

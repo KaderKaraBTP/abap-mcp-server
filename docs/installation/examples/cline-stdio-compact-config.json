@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mcp-abap-adt-compact": {
+      "command": "mcp-abap-adt-compact",
+      "args": ["--transport=stdio", "--env-path=/path/to/<destination>.env"],
+      "disabled": false
+    }
+  }
+}

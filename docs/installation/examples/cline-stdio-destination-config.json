@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mcp-abap-adt": {
+      "command": "mcp-abap-adt",
+      "args": ["--transport=stdio", "--mcp=<destination>"],
+      "disabled": false
+    }
+  }
+}

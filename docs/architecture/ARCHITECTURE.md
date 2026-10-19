@@ -1,0 +1,693 @@
+# MCP ABAP ADT -- System Architecture
+
+This document provides a comprehensive architectural description of the **mcp-abap-adt** system: a multi-component, interface-driven TypeScript platform that enables AI assistants to interact with SAP ABAP systems through the ADT (ABAP Development Tools) REST API via the Model Context Protocol (MCP).
+
+---
+
+## 1. Architectural Principles
+
+### 1.1 Interface-Only Communication (IOC)
+
+All inter-package communication occurs exclusively through TypeScript interfaces, and each interface is imported from the package that declares it. No package imports concrete implementations from another package. This is not a guideline -- it is an enforced architectural invariant.
+
+The contract used to be one package, `@mcp-abap-adt/interfaces`. It was split into `interfaces-adt`, `interfaces-auth`, `interfaces-auth-sap`, `interfaces-network` and `interfaces-utils`, and the umbrella that re-exported them is deleted -- npm serves its last release, 51.0.0, and nothing further ships there. An umbrella decides for every consumer which version of each contract they compile against, which is the coupling the split ends.
+
+```typescript
+// Correct -- depends on interface only, from the package that declares it
+import type { ISessionStore } from '@mcp-abap-adt/interfaces-auth-sap';
+
+// Prohibited -- creates concrete coupling
+import { AbapSessionStore } from '@mcp-abap-adt/auth-stores';
+```
+
+### 1.2 Dependency Inversion
+
+All high-level modules depend on abstractions (interfaces), not on low-level implementations. Concrete implementations are injected at the composition root (`launcher.ts` in the main server). This ensures that every component can be tested in isolation and replaced without modifying consumers.
+
+### 1.3 Replaceable Default Implementations
+
+Every interface shipped with the system has at least one default implementation. Consumers are free to substitute any default with a custom implementation that satisfies the same interface contract. The system makes no assumptions beyond what interfaces specify.
+
+### 1.4 Separation of Concerns
+
+Each package owns exactly one responsibility:
+
+| Concern | Package |
+|:---|:---|
+| Interface contracts | `@mcp-abap-adt/interfaces-adt`, `-auth`, `-auth-sap`, `-network`, `-utils` |
+| Logging abstraction | `@mcp-abap-adt/logger` |
+| Credential storage | `@mcp-abap-adt/auth-stores` |
+| Credential orchestration | `@mcp-abap-adt/auth-broker` |
+| Credentials and token flows | `@mcp-abap-adt/auth-providers` |
+| HTTP transport to SAP | `@mcp-abap-adt/connection` |
+| ABAP object operations | `@mcp-abap-adt/adt-clients` |
+| MCP protocol adapter | `mcp-abap-adt` (main server) |
+| Authorization proxy | `@mcp-abap-adt/proxy` |
+| Client configurator | `@mcp-abap-adt/configurator` |
+
+### 1.5 Clear Runtime Contracts
+
+Every public function and method operates against well-defined input/output types. Error conditions are expressed through typed error codes (`AdtObjectErrorCodes`, `TokenProviderErrorCodes`, `StoreErrorCodes`), not raw strings. This makes error handling deterministic across all consumers.
+
+---
+
+## 2. Component Catalogue
+
+### 2.1 The contract packages
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Source of truth for all TypeScript interfaces, types, enums and error codes, one package per domain: `interfaces-adt` (ADT objects and the connection contract), `interfaces-auth` (tokens and providers), `interfaces-auth-sap` (SAP configuration, service keys, session stores), `interfaces-network` (HTTP frame and header names), `interfaces-utils` (logging, XML shapes) |
+| **Dependencies** | `interfaces-adt` on `-network`; `-auth-sap` on `-auth`; the rest have none |
+| **Replaceable** | N/A -- defines contracts, not implementations |
+| **Runtime role** | Type-only at runtime (compile-time contracts) |
+
+**Interface domains:**
+
+| Domain | Key Interfaces | Purpose |
+|:---|:---|:---|
+| Connection | `IAbapConnection`, `IAbapRequestOptions`, `IAdtResponse` | HTTP communication with SAP ADT |
+| Authentication | `IAuthorizationConfig`, `IConnectionConfig`, `IConfig` | Auth credential structures |
+| Credential | `IAuthProvider`, `AuthOutcome` | What a connector presents: `prepare`, `establish`, `authorize`, `rejected` |
+| Session | `ISessionStore`, `ISessionStorage`, `ISessionState` | Session persistence |
+| Service Key | `IServiceKeyStore` | Service key access |
+| ADT Objects | `IAdtObject<TConfig, TState>`, `IAdtObjectState`, `IAdtObjectConfig` | CRUD lifecycle for ABAP objects |
+| Logging | `ILogger`, `LogLevel` | Structured logging |
+| Validation | `IHeaderValidationResult`, `IValidatedAuthConfig` | Header analysis |
+| SAP Config | `ISapConfig`, `SapAuthType` | SAP system configuration |
+| Headers | `HEADER_*` constants, header group arrays | HTTP header contracts |
+
+**Generic object model** -- every ABAP object type is modeled through two generic parameters:
+
+- **`TConfig`** -- static metadata (name, package, description, transport request)
+- **`TState extends IAdtObjectState`** -- accumulated operation results (read, create, lock, activate, errors)
+
+This allows `IAdtObject<TConfig, TState>` to provide a uniform CRUD interface across all 22+ supported ABAP object types.
+
+---
+
+### 2.2 @mcp-abap-adt/logger
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Logging abstraction with two default implementations |
+| **Public interface** | `ILogger` (info, error, warn, debug) |
+| **Default implementations** | `DefaultLogger` (console-based), `PinoLogger` (structured, with fallback) |
+| **Replaceable** | Yes -- any `ILogger` implementation accepted |
+| **Runtime role** | Injected into all components that produce diagnostic output |
+| **Dependencies** | `@mcp-abap-adt/interfaces-utils`; `pino` and `pino-pretty` as peer dependencies |
+
+`PinoLogger` dynamically loads `pino` at runtime. If pino is not installed, it silently falls back to `DefaultLogger`. Both implementations respect the `AUTH_LOG_LEVEL` environment variable and redact sensitive fields (passwords, tokens, authorization headers).
+
+---
+
+### 2.3 Request credentials (HTTP/SSE headers)
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Turns the connection headers of a request into settings and a credential, or names the destination the request asks for |
+| **Where** | `src/lib/credentialSources.ts` (`credentialFromHeaders`), `server/src/destinationRequest.ts` (`destinationFromHeader`) |
+| **Runtime role** | Used by the HTTP and SSE transport servers; stdio has no request headers |
+
+Per request, in this order:
+
+| Priority | Method | Headers |
+|:---|:---|:---|
+| 3 (highest) | A named destination, only with `--allow-destination-header` | `x-mcp-destination` (a plain name; anything else is refused with `400`, naming the header) |
+| 2 | A token you hold | `x-sap-url` + `x-sap-jwt-token` |
+| 1 | Basic | `x-sap-url` + `x-sap-login` + `x-sap-password` |
+| 0 | The default destination (`--mcp`, `--env`, `--env-path`) | none; with no default, `400` |
+
+A header connection gets a fixed credential (`TokenAuthProvider.fixed`, `BasicAuthProvider`); nothing renews it.
+
+---
+
+### 2.4 @mcp-abap-adt/auth-stores
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Persistent storage for service keys and session data |
+| **Public interfaces** | `IServiceKeyStore`, `ISessionStore` |
+| **Default implementations** | `AbapServiceKeyStore`, `XsuaaServiceKeyStore`, `AbapSessionStore`, `XsuaaSessionStore` |
+| **Replaceable** | Yes -- consumers can provide any `IServiceKeyStore` / `ISessionStore` |
+| **Runtime role** | Supplies credentials and persists tokens between sessions |
+| **Dependencies** | `@mcp-abap-adt/interfaces-auth-sap`, `dotenv` |
+
+Service key stores read `{destination}.json` files from a configurable directory. Session stores persist authorization and connection configurations per destination. ABAP and XSUAA variants differ in JSON structure parsing, not in interface contract.
+
+---
+
+### 2.5 @mcp-abap-adt/auth-broker
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Builds the credential a destination states, from the service key store's *means* and the session store's *secret*, and keeps what the credential obtains stored |
+| **Public interface** | `AuthBroker` (`getProvider(destination)`, `flush()`, `getConnectionConfig`, `getAuthorizationConfig`), `DestinationConfigError` |
+| **Runtime role** | One broker per destination; `getProvider` returns an `IAuthProvider` that a connector presents on every logon and request |
+| **Dependencies** | `interfaces-auth`, `interfaces-auth-broker`, `interfaces-auth-sap`, `auth-providers` |
+
+The server calls `getProvider(destination)` and hands the provider to the connector; there is no token to fetch first and no token refresher. The provider decides whether its token is still good, renews it (refresh first, then a new login) and the broker writes what it obtained to the session store. `flush()` tells the server at shutdown whether everything landed.
+
+`AuthBroker` takes a service key store (means), a session store (the secret alone) and, for the interactive grant, an `authorization` strategy that the server supplies (the browser login on port `61001`). The stores and the strategy are injected, never defaulted by the broker.
+
+---
+
+### 2.6 @mcp-abap-adt/auth-providers
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Every `IAuthProvider`: the credential a process presents, and the token providers behind it |
+| **Public interface** | `IAuthProvider` (`prepare`, `establish`, `authorize`, `rejected`) from `interfaces-auth` |
+| **Replaceable** | Yes -- any `IAuthProvider` |
+| **Runtime role** | Built by the broker for a destination; the connector calls its four methods |
+| **Dependencies** | `@mcp-abap-adt/interfaces-auth`, `-auth-sap`, `-utils`, `axios`, `express`, `open` |
+
+The server supports four authentications, each served by one handler (`src/lib/auth/handlers/`):
+
+| Authentication | `SAP_AUTH_TYPE` / `SAP_GRANT_TYPE` | Provider |
+|:---|:---|:---|
+| Basic (HTTP or RFC) | `basic` | `BasicAuthProvider` |
+| SNC (RFC only, passwordless) | `snc` | `SncLogonProvider` |
+| JWT, browser login | `jwt` / `authorization_code` | `AuthorizationCodeProvider` |
+| JWT you hold | `jwt` / `none` | `TokenAuthProvider` |
+
+Adding an authentication means a handler there, a row in this table and a test; nothing else. The package ships other providers (client credentials, passcode, the OIDC and SAML ones); this server does not serve them, and a destination that states one is refused at startup.
+
+---
+
+### 2.7 @mcp-abap-adt/connection
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | HTTP transport layer to SAP ADT REST API |
+| **Public interface** | `IAbapConnection` |
+| **Default implementations** | `AdtOnPremConnector`, `AdtCloudConnector` -- one connector per *system*; the credential is a parameter, not a subclass |
+| **Replaceable** | Yes -- any `IAbapConnection` implementation |
+| **Runtime role** | Executes ADT requests over HTTP or RFC against a SAP system, presenting the `IAuthProvider` it is handed |
+| **Dependencies** | `@mcp-abap-adt/interfaces-auth`, `-auth-sap`, `-utils`, `axios` |
+
+**Construction** -- the server has one place that builds a connector (`src/lib/connectionFactory.ts`): the system kind and the wire follow from the settings (`SAP_SYSTEM_TYPE`, `connectionType`), and the credential is the one the caller hands in. Where a credential comes from is `src/lib/credentialSources.ts` (headers, an embedder's `SapConfig`) or the broker's `getProvider(destination)`; the factory never builds one from `settings.authType`.
+
+**Key capabilities:**
+- CSRF token management (automatic fetch, cache, refresh on error)
+- Stateful/stateless session switching via `sap-contextid` headers
+- Cookie management for session persistence
+- A `401` the wire's own recovery cannot clear is put to the credential (`rejected`); if it answers Ok (a renewed token), the request gets one more attempt
+- The HTTPS server certificate verified by default (connection 11); `TLS_REJECT_UNAUTHORIZED=0` or `NODE_TLS_REJECT_UNAUTHORIZED=0` in the process environment opts out, `NODE_EXTRA_CA_CERTS` adds a CA
+- Retry logic for transient errors
+
+---
+
+### 2.8 @mcp-abap-adt/adt-clients
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Domain logic for ABAP object CRUD operations |
+| **Public interface** | `IAdtObject<TConfig, TState>` per object type |
+| **Default implementation** | `AdtClient` (factory), 22+ object-type handlers |
+| **Replaceable** | Yes -- via interface |
+| **Runtime role** | Called by MCP tool handlers to perform SAP operations |
+| **Dependencies** | `@mcp-abap-adt/interfaces-adt`, `-auth`, `-network`, `-utils`, `@mcp-abap-adt/logger`, `fast-xml-parser` |
+
+**AdtClient** is a factory that creates typed object handlers:
+
+```typescript
+const client = new AdtClient(connection, logger);
+const program = client.getProgram();     // → IAdtObject<IProgramConfig, IProgramState>
+const cls = client.getClass();           // → IAdtObject<IClassConfig, IClassState>
+const func = client.getFunctionModule(); // → IAdtObject<IFunctionModuleConfig, IFunctionModuleState>
+```
+
+**Supported ABAP object types** (22+): Class, Program, Interface, Domain, DataElement, Structure, Table, TableType, View, FunctionGroup, FunctionModule, Package, ServiceDefinition, BehaviorDefinition, BehaviorImplementation, MetadataExtension, Enhancement, UnitTest, CdsUnitTest, Transport Request, LocalDefinitions, LocalTypes, LocalMacros, LocalTestClass.
+
+**Operation chains** -- create and update operations are multi-step sequences:
+
+```
+Create: validate → create → check → lock → update → unlock → check → activate (optional)
+Update: lock → check → update → unlock → check → activate (optional)
+Delete: check(deletion) → delete
+Read:   single GET request
+```
+
+Each step accumulates results in `TState`, providing full audit trail of the operation.
+
+**AdtUtils** provides cross-cutting utilities: repository search, where-used analysis, package hierarchy traversal, table content queries, inactive object lists, and batch operations.
+
+---
+
+### 2.9 mcp-abap-adt (Main MCP Server)
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | MCP protocol adapter -- translates MCP tool calls into ADT client operations |
+| **Runtime role** | Primary application entry point; composition root |
+| **Transport modes** | `stdio`, `streamable-http`, `sse` |
+| **Dependencies** | All packages above + `@modelcontextprotocol/sdk`, `zod` |
+
+#### Composition Root
+
+`src/server/launcher.ts` is the composition root where all dependencies are wired:
+
+```
+launcher.ts main()
+  ├── ServerConfigManager.getConfig()         // CLI args, YAML, env vars
+  ├── Create handler groups (by exposition)   // ReadOnly, HighLevel, LowLevel, Search, System
+  ├── CompositeHandlersRegistry(groups)       // Aggregate registry
+  ├── AuthBrokerFactory                       // Per-destination auth broker management
+  └── Transport server (Stdio|Http|Sse)       // Start appropriate transport
+```
+
+#### Handler Architecture
+
+Handlers are organized into groups by access level:
+
+| Group | Purpose | Approx. Tool Count |
+|:---|:---|:---|
+| `ReadOnlyHandlersGroup` | Get operations (read source, metadata) | ~29 |
+| `HighLevelHandlersGroup` | Full CRUD (Create, Update, Delete, Get) | ~121 |
+| `LowLevelHandlersGroup` | Fine-grained (lock, unlock, activate, validate) | ~120 |
+| `SearchHandlersGroup` | Repository search, where-used | ~4 |
+| `SystemHandlersGroup` | System info, discovery | ~30 |
+
+Counts drift as tools are added; see [AVAILABLE_TOOLS.md](../user-guide/AVAILABLE_TOOLS.md) for the authoritative, up-to-date list.
+
+The `exposition` configuration controls which groups are active, enabling read-only deployments or full-access modes.
+
+**Handler registration flow:**
+
+```
+CompositeHandlersRegistry
+  └── for each IHandlerGroup:
+        └── BaseHandlerGroup.registerHandlers(server)
+              └── for each HandlerEntry:
+                    ├── Convert JSON Schema → Zod
+                    ├── Wrap handler with context injection
+                    └── server.registerTool(name, schema, wrappedHandler)
+```
+
+Each handler follows a uniform pattern:
+
+```typescript
+// Tool definition (static metadata)
+export const TOOL_DEFINITION = {
+  name: "GetProgram",
+  description: "Retrieve ABAP program source code",
+  inputSchema: { type: "object", properties: { program_name: { type: "string" } }, required: ["program_name"] }
+} as const;
+
+// Handler function (receives injected context)
+export async function handleGetProgram(context: HandlerContext, args: GetProgramArgs) {
+  const client = new AdtClient(context.connection, context.logger);
+  const result = await client.getProgram().read({ programName: args.program_name }, args.version || 'active');
+  return return_response(result);
+}
+```
+
+`HandlerContext` contains the `IAbapConnection` and optional `ILogger` -- injected per-request by `BaseMcpServer`.
+
+#### Transport Servers
+
+| Transport | Class | Connection Model | Session Management |
+|:---|:---|:---|:---|
+| stdio | `StdioServer` | Cached (one per server lifetime) | Single persistent session |
+| HTTP | `StreamableHttpServer` | Per-request (new server instance) | Stateless |
+| SSE | `SseServer` | Per-connection | Map by session ID |
+
+All transports extend `BaseMcpServer` which handles handler registration, connection context management, and per-request context injection.
+
+> **Design invariant:** One MCP session always maps to one SAP system, and switching SAP systems within the same session is not a supported scenario.
+>
+> Where the identity behind a call comes from is a separate question, and since 10.1.0 it has one answer. `masterLanguage`, `responsible` and `masterSystem` are read from the request scope when a scope carries them, and from the process-wide system context otherwise. A host that serves several SAP users side by side wraps each run in `runWithRequestContext`; a stdio session carries no scope and keeps the process context, unchanged. The singleton cache remains the fallback, not the source: a concurrent host that relied on it saw every create attributed to whichever user wrote it last.
+>
+> Since 10.2.0 there is a third source, and it is last. When a call still has no `responsible` or `masterSystem` and its connection is to ABAP Cloud, the library asks the system once per connection and fills only what is absent. A key the scope carries wins even when its value is `undefined`, because carrying it is how a host says this request has none. On-premise nothing is asked and nothing is filled. A host can pass its own resolver, or `null` to switch the whole thing off.
+
+---
+
+### 2.10 @mcp-abap-adt/proxy (Auxiliary Utility)
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Authorization proxy between MCP clients and remote MCP servers on BTP |
+| **Architectural relationship** | Fully independent -- can proxy to ANY MCP server, not just mcp-abap-adt |
+| **Runtime role** | Intercepts requests, obtains JWT via XSUAA, forwards authenticated requests |
+| **Transport modes** | `stdio`, `streamable-http`, `sse` |
+| **Dependencies** | `@mcp-abap-adt/auth-broker`, `@mcp-abap-adt/auth-providers`, `@mcp-abap-adt/auth-stores`, `@mcp-abap-adt/interfaces-adt`, `-auth`, `-auth-sap`, `-utils`, `@modelcontextprotocol/sdk`, `axios` |
+
+The proxy is **not** part of the main server's runtime. It is a standalone utility for scenarios where MCP clients (Cline, Copilot, Cursor) cannot perform BTP authentication directly.
+
+**Key capabilities:**
+- JWT token management with 30-minute cache TTL
+- Multi-destination support (per-destination auth brokers)
+- Circuit breaker pattern for resilience
+- Retry with exponential backoff
+- Service key-based MCP server URL discovery
+- Request/response logging with sensitive data redaction
+- Eager authentication (browser opens on startup for stdio mode)
+
+---
+
+### 2.11 @mcp-abap-adt/configurator (Auxiliary Utility)
+
+| Attribute | Value |
+|:---|:---|
+| **Responsibility** | Automates MCP server registration in client configuration files |
+| **Architectural relationship** | Fully independent -- no runtime dependency on any other package |
+| **Supported clients** | Cline, Claude, Codex, Cursor, Copilot, Goose, Windsurf, OpenCode, Antigravity, Qwen, Crush (11 total) |
+| **Operations** | add, rm, ls, show, enable, disable, where, update, tui |
+
+A pure CLI/TUI tool that handles platform-specific and client-specific configuration file formats (JSON, YAML, TOML) across global and project scopes.
+
+---
+
+## 3. Submodule Clarification
+
+Each package is an **independent git repository** with its own version, build pipeline, test suite, and npm publication. For development convenience, packages can be aggregated using **git submodules**:
+
+```
+mcp-abap-adt/              ← Own git repo, published to npm
+mcp-abap-adt-interfaces/   ← Own git repo, published to npm
+mcp-abap-adt-clients/      ← Own git repo, published to npm
+mcp-abap-connection/       ← Own git repo, published to npm
+...                        ← Each package is independent
+```
+
+**Critical distinction:**
+
+- **Submodules are purely administrative** -- they enable synchronized development and convenient cross-package navigation, but are not required
+- **Architectural isolation remains intact** -- each package has its own `package.json`, version, build pipeline, test suite, and npm publication
+- **Submodule grouping does not equal monolith** -- consuming packages individually from npm changes nothing architecturally
+- **No package references another package's source code** -- all inter-package dependencies go through npm-published interfaces
+
+---
+
+## 4. Runtime Interaction Model
+
+### 4.1 High-Level Component Interaction
+
+```mermaid
+graph TD
+    Client["MCP Client<br/>(Claude, Cline, Copilot, Cursor)"]
+    Proxy["@mcp-abap-adt/proxy<br/>(optional auth proxy)"]
+    Server["mcp-abap-adt<br/>(MCP Server)"]
+    Registry["CompositeHandlersRegistry"]
+    Handlers["Handler Groups<br/>(ReadOnly, HighLevel, LowLevel, Search, System)"]
+    AdtClients["@mcp-abap-adt/adt-clients<br/>(AdtClient factory)"]
+    Connection["@mcp-abap-adt/connection<br/>(IAbapConnection)"]
+    AuthBroker["@mcp-abap-adt/auth-broker<br/>(AuthBroker)"]
+    Providers["@mcp-abap-adt/auth-providers<br/>(IAuthProvider)"]
+    Stores["@mcp-abap-adt/auth-stores<br/>(IServiceKeyStore, ISessionStore)"]
+    SAP["SAP ABAP System<br/>(ADT REST API)"]
+
+    Client -->|"MCP protocol<br/>(stdio/http/sse)"| Proxy
+    Client -->|"MCP protocol<br/>(stdio/http/sse)"| Server
+    Proxy -->|"Authenticated HTTP"| Server
+    Server --> Registry
+    Registry --> Handlers
+    Handlers -->|"HandlerContext"| AdtClients
+    AdtClients -->|"IAbapConnection"| Connection
+    Connection -->|"HTTP/HTTPS"| SAP
+    Connection -->|"IAuthProvider (getProvider)"| AuthBroker
+    AuthBroker --> Providers
+    AuthBroker --> Stores
+    Providers -->|"OAuth2/OIDC/SAML"| SAP
+```
+
+### 4.2 Request Processing Flow (HTTP Transport)
+
+```
+1. HTTP POST /mcp/stream/http
+   └── StreamableHttpServer.createRequestHandler()
+
+2. Per-request server creation
+   └── new BaseMcpServer() instance per request
+
+3. Connection context resolution
+   ├── From x-mcp-destination header (--allow-destination-header) → IDestinations: settingsFor + getProvider(destination)
+   ├── From x-sap-url + auth headers → settings and a fixed credential from the headers
+   └── From default destination (startup config) → the same IDestinations path
+
+4. Handler invocation
+   ├── BaseMcpServer resolves tool name → handler function
+   ├── Creates HandlerContext { connection: IAbapConnection, logger: ILogger }
+   └── Calls handler(context, args)
+
+5. ADT operation execution
+   ├── Handler creates AdtClient(connection, logger)
+   ├── Calls typed operation (e.g., client.getProgram().read(...))
+   ├── AdtClient delegates to IAbapConnection.makeAdtRequest()
+   └── Connection handles auth, CSRF, retries, session
+
+6. Response
+   └── Handler returns MCP-formatted response (text content)
+```
+
+### 4.3 Inversion of Control Boundaries
+
+The system has three distinct IoC boundaries:
+
+| Boundary | What is Inverted | Composition Point |
+|:---|:---|:---|
+| **Auth** | The credential a connector presents | `ConnectionContext.credential` (an `IAuthProvider`) is built by `AuthBrokerFactory.getProvider` or from headers; the connector never builds one |
+| **Transport** | HTTP communication with SAP | `AdtClient` constructor receives `IAbapConnection` |
+| **Handlers** | Tool behavior per transport/mode | `CompositeHandlersRegistry` receives `IHandlerGroup[]` |
+
+### 4.4 Composition Root Location
+
+`mcp-abap-adt/src/server/launcher.ts` is the single composition root for the main server. It:
+
+1. Reads configuration (CLI, YAML, env)
+2. Chooses the stores of a destination (`src/lib/auth/destinationStores.ts`): an env file, or a named destination's `sessions/<name>.env` over `service-keys/<name>.json`
+3. Passes the browser-login strategy (`browserCallbackStrategy`) to `AuthBrokerFactory`; the library defaults to none
+4. Assembles one `AuthBroker` per destination via `AuthBrokerFactory`, on first use
+5. Creates handler groups with `HandlerContext`
+6. Assembles `CompositeHandlersRegistry`
+7. Starts the appropriate transport server
+
+No other file in the system creates concrete cross-package dependencies.
+
+---
+
+## 5. Extensibility Model
+
+### 5.1 Replacing Default Implementations
+
+Any interface-backed component can be replaced. The general pattern:
+
+```typescript
+// 1. Implement the interface
+class CustomSessionStore implements ISessionStore {
+  // the contract is in @mcp-abap-adt/interfaces-auth-broker: a session store
+  // holds the secret alone (token or cookies, expiry, refresh token, issuedFor, issuedBy)
+}
+
+// 2. Inject at the composition root (destinationStores.ts)
+const broker = new AuthBroker({
+  serviceKeyStore, // the means: authType, grantType, URL, client
+  sessionStore: new CustomSessionStore(),
+  authorization: () => browserLogin, // for authorization_code
+});
+```
+
+### 5.2 Custom Authentication Logic
+
+To add an authentication the server serves:
+
+1. **Implement or reuse an `IAuthProvider`** (`prepare`, `establish`, `authorize`, `rejected`; none may throw -- each answers `{ ok: true }` or a refusal)
+2. **Add an `AuthenticationHandler`** in `src/lib/auth/handlers/` that tells the broker what the destination needs, and register it in `HANDLERS`
+3. Add its row to the table in section 2.6 and a test; the rest of the system remains unchanged -- the connector presents whatever `IAuthProvider` it is given
+
+An embedder that has its own credential passes it as `ConnectionContext.credential` and the server builds nothing from settings.
+
+---
+
+### 5.3 Custom Configuration Handling
+
+`ServerConfigManager` supports:
+- CLI arguments (`--transport`, `--host`, `--port`, `--conf`, `--mcp`, `--env`, and the authentication parameters of `src/lib/config/authParameters.ts`)
+- YAML configuration files (via `--conf <path>`) -- configuration only; a secret-looking key is refused
+- Environment variables (`MCP_TRANSPORT`, `MCP_HTTP_HOST`, `MCP_HTTP_PORT`, `MCP_BROWSER_AUTH_PORT`, ...); secrets and the session live in `.env` files
+
+For deeper customization, consumers can bypass `ServerConfigManager` and construct `IServerConfig` directly.
+
+### 5.4 Extending MCP Tool Behavior
+
+To add new tools:
+
+1. **Create a handler** following the existing pattern (TOOL_DEFINITION + handler function)
+2. **Create a handler group** implementing `IHandlerGroup`
+3. **Register it** via `CompositeHandlersRegistry.addHandlerGroup()`
+
+```typescript
+class CustomHandlerGroup extends BaseHandlerGroup {
+  protected groupName = 'CustomHandlers';
+
+  getHandlers(): HandlerEntry[] {
+    return [
+      {
+        toolDefinition: { name: 'CustomTool', description: '...', inputSchema: { ... } },
+        handler: (context, args) => handleCustomTool(context, args),
+      },
+    ];
+  }
+}
+
+// At composition root
+registry.addHandlerGroup(new CustomHandlerGroup(baseContext));
+```
+
+### 5.5 Architectural Guarantees
+
+- **Interface stability** -- every contract package follows semver; breaking changes require major version bumps, and a consumer takes them one domain at a time rather than inheriting every package's history through an umbrella
+- **No hidden state** -- components do not share global mutable state (the server holds no global broker registry: each `AuthBrokerFactory` owns its brokers, and the process serves its destinations through it)
+- **Typed errors** -- all error conditions use typed error code constants, enabling programmatic error handling
+- **Operation auditability** -- `IAdtObjectState` accumulates every operation result, providing full trace of create/update/delete chains
+
+---
+
+## 6. Developer and Consumer Perspective
+
+### 6.1 For New ABAP Developers
+
+**Recommended entry path:**
+
+1. Start with `@mcp-abap-adt/interfaces-adt` -- read `IAdtObject<TConfig, TState>` to understand the CRUD contract
+2. Examine one object type in `@mcp-abap-adt/adt-clients` (e.g., `src/core/program/`) to see the operation chain pattern
+3. Look at the corresponding handler in `mcp-abap-adt/src/handlers/program/` to understand how MCP tool calls map to ADT operations
+4. Study `@mcp-abap-adt/connection` to understand how HTTP requests reach SAP
+
+**Key concept:** Every ABAP object type (Class, Program, Table, etc.) follows the identical pattern: `TConfig` input, `IAdtObject` interface, `TState` accumulation. Learn one, understand all.
+
+### 6.2 Typical Usage Scenarios
+
+| Scenario | Components Used | Transport |
+|:---|:---|:---|
+| Local development with Claude Code | Main server | stdio |
+| Team deployment on BTP | Main server + proxy | HTTP |
+| Read-only monitoring | Main server (exposition=readonly) | HTTP/SSE |
+| Custom IDE integration | Main server (as npm dependency) | Embedded via `EmbeddableMcpServer` |
+| Multi-system landscape | Main server + proxy (multi-destination) | HTTP |
+
+### 6.3 SAP Consultant Integration
+
+Consultants working with customer systems typically:
+
+1. Use `@mcp-abap-adt/configurator` to set up their MCP client
+2. Configure service keys for BTP systems or basic auth for on-premise
+3. Deploy the proxy for team-shared access with centralized auth
+4. Control tool exposure via `exposition` config (readonly for auditing, full for development)
+
+### 6.4 Support Usage Patterns
+
+For troubleshooting:
+
+- Enable debug logging: `AUTH_LOG_LEVEL=debug` or `DEBUG_AUTH_LOG=true`
+- Token flow diagnostics: `AuthBroker` logs every step of the acquisition flow
+- Connection diagnostics: `AbstractAbapConnection` logs CSRF operations, retries, and session state
+- Handler diagnostics: Each handler logs operation parameters and error details
+- All sensitive data (tokens, passwords, secrets) is redacted in log output
+
+---
+
+## 7. Architecture Validation
+
+### 7.1 Architecture Style Classification
+
+**Primary style:** Component-based architecture with dependency injection
+
+**Supporting patterns:**
+- Factory pattern (`AdtClient`, `createAbapConnection`, `AuthBrokerFactory`)
+- Strategy pattern (`IAuthProvider` implementations selected per destination by the authentication handlers)
+- Composite pattern (`CompositeHandlersRegistry` aggregates `IHandlerGroup[]`)
+- Chain of Responsibility (operation chains in `IAdtObject` implementations)
+- Template Method (`BaseTokenProvider`, `AbstractAbapConnection`, `BaseHandlerGroup`)
+
+### 7.2 Coupling Assessment
+
+| Coupling Type | Level | Evidence |
+|:---|:---|:---|
+| Interface coupling | Low | All cross-package communication through interfaces |
+| Data coupling | Low | Well-defined DTOs (`IConfig`, `ITokenResult`, `IAdtResponse`) |
+| Runtime coupling | Low | A connector receives its credential; no global registry |
+| Temporal coupling | Low | No implicit ordering between components (explicit operation chains only) |
+| Build coupling | None | Each package builds independently |
+
+### 7.3 Replaceability Assessment
+
+| Component | Replaceability | Effort |
+|:---|:---|:---|
+| Logger | Full | Implement 4-method `ILogger` interface |
+| Session Store | Full | Implement `ISessionStore` (6 methods) |
+| Service Key Store | Full | Implement `IServiceKeyStore` (3 methods) |
+| Credential | Full | Implement `IAuthProvider` (4 methods) |
+| Connection | Full | Implement `IAbapConnection` (4 methods) |
+| Handler Groups | Full | Implement `IHandlerGroup` (3 methods) |
+| Auth Broker | Moderate | Replace `AuthBroker` class (non-interface, but clear method contract) |
+| Transport Server | Moderate | Extend `BaseMcpServer` and implement transport-specific logic |
+
+### 7.4 Strengths
+
+- **Strict interface isolation** prevents accidental coupling between packages
+- **Four authentications** -- basic, SNC, JWT with browser login, JWT you hold -- covering on-premise through BTP cloud
+- **Operation chain model** provides atomic, auditable CRUD sequences with automatic lock/unlock
+- **Exposition control** enables deployment profiles (read-only, full CRUD, low-level)
+- **Transport flexibility** (stdio, HTTP, SSE) adapts to different client architectures
+- **22+ ABAP object types** with uniform interface -- broad coverage with consistent API
+
+### 7.5 Risks
+
+| Risk | Mitigation |
+|:---|:---|
+| Two destinations logging in at once would race for the callback port | One login at a time per process; the first connect of a destination runs inside its lock |
+| Large handler count (~150 tools) may overwhelm AI model context | `exposition` config limits visible tools per deployment |
+| XML parsing of ADT responses is fragile across SAP versions | `fast-xml-parser` with per-object-type parsers; integration tests validate against real systems |
+| Service key files stored on filesystem | Configurable directory; `unsafe` flag controls file vs. in-memory storage |
+
+### 7.6 Recommendations
+
+1. **For new contributors:** Follow the existing handler pattern exactly -- tool definition + handler function + handler group registration. Do not introduce new cross-package dependencies.
+2. **For custom deployments:** Start with the `exposition` config and `EmbeddableMcpServer` before building custom infrastructure.
+3. **For enterprise adoption:** Use the proxy for centralized BTP authentication and the configurator for standardized client setup across teams.
+4. **For extending object type support:** Add a new module under `@mcp-abap-adt/adt-clients/src/core/{type}/` following the established pattern (types, CRUD functions, `IAdtObject` implementation).
+
+---
+
+## Appendix: Dependency Hierarchy
+
+```
+@mcp-abap-adt/interfaces-adt, -auth, -auth-sap, -network, -utils (the contracts)
+│
+├── @mcp-abap-adt/logger
+│
+├── @mcp-abap-adt/auth-stores
+│
+├── @mcp-abap-adt/connection
+│   └── @mcp-abap-adt/adt-clients
+│
+├── @mcp-abap-adt/auth-providers
+│
+├── @mcp-abap-adt/auth-broker
+│
+└── mcp-abap-adt (main server -- composition root, consumes all)
+    ├── Depends on all packages above
+    └── @modelcontextprotocol/sdk
+
+@mcp-abap-adt/proxy (independent auxiliary -- uses auth-broker, auth-stores, auth-providers)
+
+@mcp-abap-adt/configurator (independent auxiliary -- no runtime deps on other packages)
+```
+
+---
+
+## Known Limitations
+
+### Parallel Tool Calls
+
+MCP tool calls that modify SAP objects (Create, Update, Delete) must be executed **sequentially**, not in parallel. Each MCP server instance uses a single ABAP connection with one CSRF token and one HTTP session. Parallel write operations cause:
+
+- **CSRF token conflicts** -- SAP ties CSRF tokens to HTTP sessions; concurrent requests invalidate each other's tokens.
+- **Session type race conditions** -- lock/unlock operations toggle the connection between stateful and stateless modes; concurrent toggles corrupt session state.
+- **Lock conflicts** -- SAP DDIC objects support only one lock per object; parallel locks on the same object will fail.
+
+Read-only operations (Read*, Search*, Get*) are safe to call in any order since they don't require CSRF tokens or session state changes.
+
+**For LLM clients**: configure the MCP client to send write tool calls one at a time. If the client batches multiple Create/Update calls in a single message, they must be serialized before reaching the server.

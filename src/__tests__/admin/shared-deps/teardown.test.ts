@@ -1,0 +1,287 @@
+/**
+ * Admin script: Teardown ALL shared dependencies from a SAP system.
+ *
+ * Deletes every object listed in shared_dependencies (test-config.yaml)
+ * in reverse dependency order. Idempotent — ignores 404 (already gone).
+ *
+ * Run:  npm run shared:teardown
+ */
+
+import type { AdtClient } from '@mcp-abap-adt/adt-clients';
+import { analyseDeletion } from '@mcp-abap-adt/adt-strategies';
+import type { IAbapConnection } from '@mcp-abap-adt/interfaces-adt-connection';
+import { createAdtClient } from '../../../lib/clients';
+import { getSystemContext } from '../../../lib/systemContext';
+import {
+  getSharedDependenciesConfig,
+  getTimeout,
+  loadTestConfig,
+} from '../../integration/helpers/configHelpers';
+import { createTestLogger } from '../../integration/helpers/loggerHelpers';
+import { primeSystemContext } from '../../integration/helpers/primeSystemContext';
+import { createTestConnectionAndSession } from '../../integration/helpers/sessionHelpers';
+import {
+  resetSharedDependencyCache,
+  safeDelete,
+} from '../../integration/helpers/sharedObjects';
+
+const testsLogger = createTestLogger('shared-teardown');
+
+describe('Admin: Teardown shared dependencies', () => {
+  let connection: IAbapConnection;
+  let client: AdtClient;
+  // An admin script runs only when asked for (npm run shared:*), so a system
+  // it cannot reach is a failure, not a skip: a green run that did nothing
+  // reads as "the shared objects are torn down".
+  let connectionError: Error | undefined;
+
+  beforeAll(async () => {
+    try {
+      const result = await createTestConnectionAndSession();
+      connection = result.connection;
+      await primeSystemContext(connection);
+      const systemCtx = getSystemContext();
+      client = createAdtClient(connection);
+    } catch (error: any) {
+      connectionError = error;
+    }
+  });
+
+  it(
+    'should delete all shared dependencies in reverse order',
+    async () => {
+      if (connectionError) {
+        throw new Error(
+          `No connection to the system, nothing was torn down: ${connectionError.message}`,
+        );
+      }
+
+      const sharedConfig = getSharedDependenciesConfig();
+      if (!sharedConfig) {
+        throw new Error(
+          'No shared_dependencies in tests/test-config.yaml, nothing to do',
+        );
+      }
+
+      const config = loadTestConfig();
+      const transportRequest =
+        sharedConfig.transport_request ||
+        config?.environment?.default_transport ||
+        undefined;
+
+      const results: Array<{
+        type: string;
+        name: string;
+        status: string;
+      }> = [];
+
+      // Reverse dependency order: FM → FG → classes → bdefs → views → tables → package
+
+      // 0a. Function Modules (delete before Function Groups)
+      const functionModules = sharedConfig.function_modules || [];
+      for (const item of functionModules) {
+        const status = await safeDelete(
+          `function_module ${item.name}`,
+          () =>
+            client.getFunctionModule().delete(
+              {
+                functionModuleName: item.name,
+                functionGroupName: item.group,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({
+          type: 'function_modules',
+          name: item.name,
+          status,
+        });
+      }
+
+      // 0b. Function Groups (delete after Function Modules)
+      const functionGroups = sharedConfig.function_groups || [];
+      for (const item of functionGroups) {
+        const status = await safeDelete(
+          `function_group ${item.name}`,
+          () =>
+            client.getFunctionGroup().delete(
+              {
+                functionGroupName: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({
+          type: 'function_groups',
+          name: item.name,
+          status,
+        });
+      }
+
+      // 1. Classes (implementation classes for BDEFs — delete before BDEFs)
+      const classes = sharedConfig.classes || [];
+      for (const item of classes) {
+        const status = await safeDelete(
+          `class ${item.name}`,
+          () =>
+            client.getClass().delete(
+              {
+                className: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({ type: 'classes', name: item.name, status });
+      }
+
+      // 1b. Service definitions (delete before views they depend on)
+      const serviceDefinitions = sharedConfig.service_definitions || [];
+      for (const item of serviceDefinitions) {
+        const status = await safeDelete(
+          `service_definition ${item.name}`,
+          () =>
+            client.getServiceDefinition().delete(
+              {
+                serviceDefinitionName: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({
+          type: 'service_definitions',
+          name: item.name,
+          status,
+        });
+      }
+
+      // 2. Behavior definitions
+      const bdefs = sharedConfig.behavior_definitions || [];
+      for (const item of bdefs) {
+        const status = await safeDelete(
+          `behavior_definition ${item.name}`,
+          () =>
+            client.getBehaviorDefinition().delete(
+              {
+                name: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({
+          type: 'behavior_definitions',
+          name: item.name,
+          status,
+        });
+      }
+
+      // 3. Views
+      const views = sharedConfig.views || [];
+      for (const item of views) {
+        const status = await safeDelete(
+          `view ${item.name}`,
+          () =>
+            client.getDdl().delete(
+              {
+                ddlName: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({ type: 'views', name: item.name, status });
+      }
+
+      // 3b. Structures (delete after views, before tables).
+      // Reverse the config list order so the BASE structure (which embeds the
+      // include via `include`) is deleted before the included structure —
+      // otherwise the include reference blocks deletion of the child.
+      const structures = [...(sharedConfig.structures || [])].reverse();
+      for (const item of structures) {
+        const status = await safeDelete(
+          `structure ${item.name}`,
+          () =>
+            client.getStructure().delete(
+              {
+                structureName: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({ type: 'structures', name: item.name, status });
+      }
+
+      // 4. Tables
+      const tables = sharedConfig.tables || [];
+      for (const item of tables) {
+        const status = await safeDelete(
+          `table ${item.name}`,
+          () =>
+            client.getTable().delete(
+              {
+                tableName: item.name,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({ type: 'tables', name: item.name, status });
+      }
+
+      // 5. Package (last — after all contents removed)
+      if (sharedConfig.package) {
+        const status = await safeDelete(
+          `package ${sharedConfig.package}`,
+          () =>
+            client.getPackage().delete(
+              {
+                packageName: sharedConfig.package,
+                transportRequest,
+              },
+              { analyse: analyseDeletion },
+            ),
+          testsLogger,
+        );
+        results.push({
+          type: 'package',
+          name: sharedConfig.package,
+          status,
+        });
+      }
+
+      // Clear in-memory caches
+      resetSharedDependencyCache();
+
+      // Summary
+      const deleted = results.filter((r) => r.status === 'deleted');
+      const notFound = results.filter((r) => r.status === 'not_found');
+      const failed = results.filter((r) => r.status === 'failed');
+
+      testsLogger?.info?.(
+        `Teardown complete: ${deleted.length} deleted, ${notFound.length} already gone, ${failed.length} failed`,
+      );
+
+      if (failed.length > 0) {
+        for (const f of failed) {
+          testsLogger?.error?.(`  ${f.type}:${f.name} — ${f.status}`);
+        }
+      }
+
+      expect(failed.length).toBe(0);
+    },
+    getTimeout('long'),
+  );
+});

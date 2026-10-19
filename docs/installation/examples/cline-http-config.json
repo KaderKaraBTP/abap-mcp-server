@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mcp-abap-adt-http": {
+      "type": "streamableHttp",
+      "url": "http://localhost:3000/mcp/stream/http",
+      "disabled": false
+    }
+  }
+}

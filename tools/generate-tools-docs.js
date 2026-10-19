@@ -1,0 +1,1087 @@
+#!/usr/bin/env node
+
+/**
+ * Generate AVAILABLE_TOOLS.md from TOOL_DEFINITION in src/handlers/**
+ *
+ * Rules:
+ * - Scan code folders only (src/handlers)
+ * - Hierarchy in output: Group(level) -> Object(folder) -> Tools
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const HANDLERS_ROOT = path.join(__dirname, '../src/handlers');
+// Per-object high-level version tools are built by a DRY factory (#30) rather
+// than one-TOOL_DEFINITION-per-file, so the file walker can't see them. Parse
+// the factory's VERSIONED_TYPES table directly.
+const OBJECT_VERSION_TOOLS_PATH = path.join(
+  __dirname,
+  '../src/handlers/common/high/objectVersionTools.ts',
+);
+const OUTPUT_PATHS = {
+  all: path.join(__dirname, '../docs/user-guide/AVAILABLE_TOOLS.md'),
+  readonly: path.join(
+    __dirname,
+    '../docs/user-guide/AVAILABLE_TOOLS_READONLY.md',
+  ),
+  high: path.join(__dirname, '../docs/user-guide/AVAILABLE_TOOLS_HIGH.md'),
+  low: path.join(__dirname, '../docs/user-guide/AVAILABLE_TOOLS_LOW.md'),
+  legacy: path.join(__dirname, '../docs/user-guide/AVAILABLE_TOOLS_LEGACY.md'),
+};
+const LEVELS = ['readonly', 'high', 'low', 'debug'];
+
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(`
+Usage: node tools/generate-tools-docs.js
+
+Scans src/handlers/**/(readonly|high|low|debug)/*.ts and generates:
+  docs/user-guide/AVAILABLE_TOOLS.md
+  docs/user-guide/AVAILABLE_TOOLS_READONLY.md
+  docs/user-guide/AVAILABLE_TOOLS_HIGH.md
+  docs/user-guide/AVAILABLE_TOOLS_LOW.md
+  docs/user-guide/AVAILABLE_TOOLS_LEGACY.md   (only when a tool declares legacy)
+
+Output hierarchy:
+  1) Group (level)
+  2) Object (folder under src/handlers)
+  3) Tools (TOOL_DEFINITION.name)
+`);
+  process.exit(0);
+}
+
+function titleCaseFolder(folder) {
+  return folder
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function slug(value) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-');
+}
+
+function anchorFromHeading(heading) {
+  // GitHub-style links are derived from heading text.
+  return slug(heading);
+}
+
+function walk(dir, acc) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walk(full, acc);
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith('.ts')) {
+      acc.push(full);
+    }
+  }
+}
+
+function findToolDefinitionBlock(content) {
+  const marker = 'export const TOOL_DEFINITION';
+  const start = content.indexOf(marker);
+  if (start === -1) return null;
+
+  const firstBrace = content.indexOf('{', start);
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let isEscaped = false;
+
+  for (let i = firstBrace; i < content.length; i++) {
+    const ch = content[i];
+
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      isEscaped = true;
+      continue;
+    }
+
+    if (!inDouble && !inTemplate && ch === "'") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (!inSingle && !inTemplate && ch === '"') {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === '`') {
+      inTemplate = !inTemplate;
+      continue;
+    }
+
+    if (inSingle || inDouble || inTemplate) continue;
+
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return content.slice(firstBrace, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractInputSchemaBlock(toolBlock) {
+  const key = 'inputSchema';
+  const keyPos = toolBlock.indexOf(key);
+  if (keyPos === -1) return null;
+
+  const firstBrace = toolBlock.indexOf('{', keyPos);
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  for (let i = firstBrace; i < toolBlock.length; i++) {
+    const ch = toolBlock[i];
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return toolBlock.slice(firstBrace, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractInputSchemaRef(toolBlock) {
+  const refMatch = toolBlock.match(/inputSchema\s*:\s*([A-Za-z0-9_]+)\b/);
+  return refMatch ? refMatch[1] : null;
+}
+
+/**
+ * A `description:` whose value is several string literals joined with `+`.
+ *
+ * This reads source with regexes rather than importing the built definitions, so
+ * a concatenation used to be captured up to its FIRST literal and the rest of the
+ * text was dropped from the generated docs — five tools lost a whole sentence
+ * each, and `CreateCdsUnitTest` ended on the seam, which is the trailing space a
+ * reviewer saw in `git diff --check` (PR #244). Reads the whole chain now.
+ */
+function readDescription(text) {
+  const LITERAL =
+    '\'(?:\\\\.|[^\'\\\\])*\'|"(?:\\\\.|[^"\\\\])*"|`(?:\\\\.|[^`\\\\])*`';
+  const chain = text.match(
+    new RegExp(
+      `description\\s*:\\s*((?:${LITERAL})(?:\\s*\\+\\s*(?:${LITERAL}))*)`,
+    ),
+  );
+  if (!chain) return '';
+  return (chain[1].match(new RegExp(LITERAL, 'g')) || [])
+    .map((part) => part.slice(1, -1).replace(/\\(['"`\\])/g, '$1'))
+    .join('');
+}
+
+function findMatchingBrace(content, openIndex) {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let isEscaped = false;
+
+  for (let i = openIndex; i < content.length; i++) {
+    const ch = content[i];
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      isEscaped = true;
+      continue;
+    }
+    if (!inDouble && !inTemplate && ch === "'") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (!inSingle && !inTemplate && ch === '"') {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === '`') {
+      inTemplate = !inTemplate;
+      continue;
+    }
+    if (inSingle || inDouble || inTemplate) continue;
+
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function extractNamedObjectContent(block, key) {
+  const keyPos = block.indexOf(key);
+  if (keyPos === -1) return null;
+  const open = block.indexOf('{', keyPos);
+  if (open === -1) return null;
+  const close = findMatchingBrace(block, open);
+  if (close === -1) return null;
+  return block.slice(open + 1, close);
+}
+
+function extractTopLevelRequiredArray(block) {
+  const matches = [...block.matchAll(/required\s*:\s*\[([^\]]*)\]/g)];
+  if (matches.length === 0) return [];
+  const raw = matches[matches.length - 1][1];
+  return raw
+    .split(',')
+    .map((s) => s.trim().replace(/['"]/g, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Skip whitespace, separators AND comments from `i` onward.
+ *
+ * The comments matter: this scanner reads a tool's `properties` object as
+ * text, and a `//` comment inside it is text too. A sentence containing the
+ * words "may or may not want:" put a parameter called `want` into three
+ * published documentation files, typed `any` and described with nothing —
+ * a parameter no tool has and no caller can pass. Prose belongs in a schema
+ * block as much as anywhere else; it is this reader that had to learn to
+ * step over it.
+ */
+function skipIgnorable(text, i) {
+  for (;;) {
+    while (i < text.length && /[\s,\n\r\t]/.test(text[i])) i++;
+    if (text[i] === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (text[i] === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 2;
+      continue;
+    }
+    return i;
+  }
+}
+
+function parseTopLevelProperties(propertiesContent) {
+  const props = {};
+  let i = 0;
+  while (i < propertiesContent.length) {
+    i = skipIgnorable(propertiesContent, i);
+    if (i >= propertiesContent.length) break;
+
+    const keyMatch = propertiesContent.slice(i).match(/^([A-Za-z0-9_]+)/);
+    if (!keyMatch) {
+      i++;
+      continue;
+    }
+    const key = keyMatch[1];
+    i += key.length;
+
+    i = skipIgnorable(propertiesContent, i);
+    if (propertiesContent[i] !== ':') continue;
+    i++;
+    i = skipIgnorable(propertiesContent, i);
+    if (propertiesContent[i] === '{') {
+      const open = i;
+      const close = findMatchingBrace(propertiesContent, open);
+      if (close === -1) break;
+      const body = propertiesContent.slice(open + 1, close);
+
+      const type =
+        body.match(/type\s*:\s*(['"])((?:\\.|(?!\1).)*)\1/)?.[2] || 'any';
+      const description = readDescription(body);
+      const defaultRaw = body.match(/default\s*:\s*([^,\n]+)/)?.[1]?.trim();
+
+      props[key] = {
+        type,
+        description,
+        default: defaultRaw
+          ? defaultRaw.replace(/^['"]|['"]$/g, '')
+          : undefined,
+      };
+      i = close + 1;
+      continue;
+    }
+
+    // Fallback for schema references like "object_type: commonObjectTypeSchema"
+    props[key] = { type: 'any', description: '', default: undefined };
+    while (
+      i < propertiesContent.length &&
+      propertiesContent[i] !== ',' &&
+      propertiesContent[i] !== '\n'
+    ) {
+      i++;
+    }
+    i++;
+  }
+  return props;
+}
+
+function parseInputSchemaBlock(inputSchemaBlock) {
+  const inputSchema = {
+    properties: {},
+    required: [],
+  };
+
+  if (!inputSchemaBlock) return inputSchema;
+
+  inputSchema.required = extractTopLevelRequiredArray(inputSchemaBlock);
+  const propertiesContent = extractNamedObjectContent(
+    inputSchemaBlock,
+    'properties',
+  );
+  if (propertiesContent) {
+    inputSchema.properties = parseTopLevelProperties(propertiesContent);
+  }
+
+  return inputSchema;
+}
+
+function extractImportPathForSymbol(content, symbol) {
+  const importRegex = /import\s*\{([\s\S]*?)\}\s*from\s*['"]([^'"]+)['"]/g;
+  let m = importRegex.exec(content);
+  while (m !== null) {
+    const symbolsRaw = m[1];
+    const importPath = m[2];
+    const symbols = symbolsRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (symbols.includes(symbol)) {
+      return importPath;
+    }
+    m = importRegex.exec(content);
+  }
+  return null;
+}
+
+function extractToolDefinition(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const block = findToolDefinitionBlock(content);
+  if (!block) return null;
+
+  const nameMatch = block.match(/name\s*:\s*['"]([^'"]+)['"]/);
+  if (!nameMatch) return null;
+
+  const toolDescription = readDescription(block);
+  const inputSchemaBlock = extractInputSchemaBlock(block);
+  const inputSchemaRef = inputSchemaBlock ? null : extractInputSchemaRef(block);
+  let inputSchema = parseInputSchemaBlock(inputSchemaBlock);
+
+  // Resolve referenced schema (e.g. compactActionSchema) from imported file.
+  if (
+    inputSchemaRef &&
+    Object.keys(inputSchema.properties).length === 0 &&
+    filePath.endsWith('.ts')
+  ) {
+    const importPath = extractImportPathForSymbol(content, inputSchemaRef);
+    if (importPath) {
+      const resolvedPath = path.resolve(
+        path.dirname(filePath),
+        `${importPath}.ts`,
+      );
+      if (fs.existsSync(resolvedPath)) {
+        const refContent = fs.readFileSync(resolvedPath, 'utf8');
+        const refBlock = extractConstObjectBlock(refContent, inputSchemaRef);
+        if (refBlock) {
+          inputSchema = parseInputSchemaBlock(refBlock);
+        }
+      }
+    }
+  }
+
+  // Extract available_in array
+  const availableInMatch = block.match(/available_in\s*:\s*\[([^\]]*)\]/);
+  let availableIn = [];
+  if (availableInMatch) {
+    availableIn = availableInMatch[1]
+      .split(',')
+      .map((s) => s.trim().replace(/['"]/g, ''))
+      .filter(Boolean);
+  }
+
+  return {
+    name: nameMatch[1],
+    description: toolDescription,
+    inputSchema,
+    inputSchemaRef,
+    availableIn,
+  };
+}
+
+function extractConstObjectBlock(content, constName) {
+  const marker = `export const ${constName}`;
+  const start = content.indexOf(marker);
+  if (start === -1) return null;
+
+  const firstBrace = content.indexOf('{', start);
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  for (let i = firstBrace; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return content.slice(firstBrace, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parseMatrixObject(block) {
+  const result = {};
+  const entryPattern = /([A-Z_]+)\s*:\s*\[([^\]]*)\]/g;
+  let entry = entryPattern.exec(block);
+  while (entry !== null) {
+    const objectType = entry[1];
+    const rawValues = entry[2].trim();
+    const values = rawValues
+      ? rawValues
+          .split(',')
+          .map((s) => s.trim().replace(/['"]/g, ''))
+          .filter(Boolean)
+      : [];
+    result[objectType] = values;
+    entry = entryPattern.exec(block);
+  }
+  return result;
+}
+
+/**
+ * Synthesize doc entries for the per-object high-level version tools (#30),
+ * which are produced by the buildObjectVersionTools() factory and therefore are
+ * not discoverable by the per-file TOOL_DEFINITION walker. Parses the factory's
+ * VERSIONED_TYPES table to stay in sync with the source of truth.
+ */
+function loadObjectVersionTools() {
+  const content = fs.readFileSync(OBJECT_VERSION_TOOLS_PATH, 'utf8');
+  const rowRegex =
+    /object_type:\s*'([^']+)',\s*display:\s*'([^']+)',\s*nameParam:\s*'([^']+)',\s*label:\s*'([^']+)',\s*available_in:\s*\[([^\]]*)\]/g;
+  const tools = [];
+  let m = rowRegex.exec(content);
+  while (m !== null) {
+    const [, objectType, display, nameParam, label, availRaw] = m;
+    const availableIn = availRaw
+      .split(',')
+      .map((s) => s.trim().replace(/['"]/g, ''))
+      .filter(Boolean);
+    const isFm = objectType === 'function_module';
+
+    const versionsProps = {
+      [nameParam]: { type: 'string', description: `${label} name.` },
+    };
+    const versionsRequired = [nameParam];
+    if (isFm) {
+      versionsProps.function_group_name = {
+        type: 'string',
+        description: 'Owning function group name (required).',
+      };
+      versionsRequired.push('function_group_name');
+    }
+
+    tools.push({
+      name: `Get${display}Versions`,
+      description: `[read-only] List the SAP version history of a ${label}. Returns each version with its versionId, author, updatedAt, title, the transportRequest (and transportDescription) that produced it when available, and an opaque content_uri to fetch that version's source via Get${display}VersionSource.`,
+      inputSchema: { properties: versionsProps, required: versionsRequired },
+      inputSchemaRef: null,
+      availableIn,
+      objectFolder: 'common',
+      objectTitle: titleCaseFolder('common'),
+      level: 'high',
+      filePath: 'src/handlers/common/high/objectVersionTools.ts',
+    });
+    tools.push({
+      name: `Get${display}VersionSource`,
+      description: `[read-only] Fetch the source of a specific ${label} version by its content_uri (taken from a Get${display}Versions entry).`,
+      inputSchema: {
+        properties: {
+          content_uri: {
+            type: 'string',
+            description: `Opaque content_uri taken from a Get${display}Versions entry.`,
+          },
+        },
+        required: ['content_uri'],
+      },
+      inputSchemaRef: null,
+      availableIn,
+      objectFolder: 'common',
+      objectTitle: titleCaseFolder('common'),
+      level: 'high',
+      filePath: 'src/handlers/common/high/objectVersionTools.ts',
+    });
+    tools.push({
+      name: `Get${display}VersionDiff`,
+      description: `[read-only] Compute a unified diff between two ${label} versions, by their content_uris (taken from Get${display}Versions entries).`,
+      inputSchema: {
+        properties: {
+          content_uri_from: {
+            type: 'string',
+            description: `Opaque content_uri of the OLD/base version (from a Get${display}Versions entry).`,
+          },
+          content_uri_to: {
+            type: 'string',
+            description: `Opaque content_uri of the NEW/compare version (from a Get${display}Versions entry).`,
+          },
+        },
+        required: ['content_uri_from', 'content_uri_to'],
+      },
+      inputSchemaRef: null,
+      availableIn,
+      objectFolder: 'common',
+      objectTitle: titleCaseFolder('common'),
+      level: 'high',
+      filePath: 'src/handlers/common/high/objectVersionTools.ts',
+    });
+    m = rowRegex.exec(content);
+  }
+  return tools;
+}
+
+/**
+ * The text the model actually receives, taken from the BUILT definitions.
+ *
+ * **Why from `dist` and not from the source.** Three reviewer findings on PR #244
+ * were the same defect wearing different clothes: a Zod `.description` is a
+ * prototype getter and was invisible to `Object.entries`; a description built as
+ * `'…' + '…'` was cut at the first literal; a template literal printed
+ * `${commonObjectTypeSchema.description}` verbatim, because no regex evaluates an
+ * interpolation. Source text and shipped text are not the same thing, and the docs
+ * must show the shipped one — the string a consumer's RAG indexes and a model reads.
+ *
+ * **Which is exactly why a stale `dist` may not be used silently.** A fourth
+ * finding: the reviewer edited `DeleteClass`'s description, ran `docs:tools`, and
+ * the generator answered success while documenting the previous text, because
+ * `docs:tools` did not build. Reading `dist` is only correct when `dist` is newer
+ * than every source file, so that is a precondition now and not an assumption: it
+ * is checked, and a stale or absent build stops the run with what to do about it.
+ * `npm run docs:tools` builds first, so the ordinary path needs no thought.
+ */
+function newestMtime(dir, extensions) {
+  let newest = 0;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!extensions.some((extension) => entry.name.endsWith(extension)))
+        continue;
+      const { mtimeMs } = fs.statSync(full);
+      if (mtimeMs > newest) newest = mtimeMs;
+    }
+  }
+  return newest;
+}
+
+/**
+ * Stops the run rather than documenting text nobody ships.
+ *
+ * Throws instead of calling `process.exit`, because this module is also required
+ * by a unit test and a generator that kills the process from inside a test run is
+ * its own kind of defect. The CLI at the bottom turns it into an exit code.
+ */
+function requireFreshBuild(distEntry) {
+  const advice =
+    'Run `npm run build` first — or `npm run docs:tools`, which builds.';
+  if (!fs.existsSync(distEntry)) {
+    throw new Error(`${distEntry} is missing. ${advice}`);
+  }
+  const sourceRoot = path.join(__dirname, '..', 'src');
+  const distRoot = path.join(__dirname, '..', 'dist');
+  const source = newestMtime(sourceRoot, ['.ts']);
+  const built = newestMtime(distRoot, ['.js']);
+  if (source > built) {
+    const behind = Math.round((source - built) / 1000);
+    throw new Error(
+      `dist is ${behind}s behind src, so the documented descriptions would not be the ones this tree ships. ${advice}`,
+    );
+  }
+}
+
+function builtDefinitions() {
+  const distEntry = path.join(
+    __dirname,
+    '..',
+    'dist',
+    'lib',
+    'handlers',
+    'HandlerExporter.js',
+  );
+  requireFreshBuild(distEntry);
+  const { HandlerExporter } = require(distEntry);
+  const entries = new HandlerExporter({
+    includeReadOnly: true,
+    includeHighLevel: true,
+    includeLowLevel: true,
+    includeSystem: true,
+    includeSearch: true,
+    includeDebug: true,
+  }).getHandlerEntries();
+  const byName = new Map();
+  for (const entry of entries)
+    byName.set(entry.toolDefinition.name, entry.toolDefinition);
+  return byName;
+}
+
+/** A parameter's own schema, in either shape a definition is written in. */
+function builtProperty(definition, key) {
+  const flat = definition.inputSchema;
+  const properties = flat && flat.properties ? flat.properties : flat;
+  return properties ? properties[key] : undefined;
+}
+
+/** Overwrite parsed text with the shipped text, tool by tool and parameter by parameter. */
+function applyBuiltText(tools) {
+  const built = builtDefinitions();
+  for (const tool of tools) {
+    const definition = built.get(tool.name);
+    if (!definition) continue;
+    if (typeof definition.description === 'string' && definition.description)
+      tool.description = definition.description;
+    // The debug tools compose their schemas from shared spreads, which the file
+    // parser cannot follow: their whole (plain JSON) schema is taken from the build.
+    if (
+      tool.level === 'debug' &&
+      definition.inputSchema &&
+      definition.inputSchema.type === 'object'
+    ) {
+      tool.inputSchema = definition.inputSchema;
+      continue;
+    }
+    const props = tool.inputSchema && tool.inputSchema.properties;
+    if (!props) continue;
+    for (const key of Object.keys(props)) {
+      // `.description` by ACCESS, so a Zod getter answers as well as a plain key.
+      const stated = builtProperty(definition, key);
+      const text = stated ? stated.description : undefined;
+      if (typeof text === 'string' && text) props[key].description = text;
+    }
+  }
+  return tools;
+}
+
+function loadToolsFromHandlers() {
+  const files = [];
+  walk(HANDLERS_ROOT, files);
+
+  const tools = [...loadObjectVersionTools()];
+
+  for (const filePath of files) {
+    const rel = path.relative(HANDLERS_ROOT, filePath).replace(/\\/g, '/');
+    const parts = rel.split('/');
+    if (parts.length < 3) continue;
+
+    const objectFolder = parts[0];
+    const level = parts[1];
+    if (!LEVELS.includes(level)) continue;
+
+    const toolDef = extractToolDefinition(filePath);
+    if (!toolDef) continue;
+
+    tools.push({
+      ...toolDef,
+      objectFolder,
+      objectTitle: titleCaseFolder(objectFolder),
+      level,
+      filePath: `src/handlers/${rel}`,
+    });
+  }
+
+  tools.push(...readOnlyCopies(tools));
+
+  tools.sort((a, b) => {
+    if (a.level !== b.level)
+      return LEVELS.indexOf(a.level) - LEVELS.indexOf(b.level);
+    if (a.objectTitle !== b.objectTitle)
+      return a.objectTitle.localeCompare(b.objectTitle);
+    return a.name.localeCompare(b.name);
+  });
+
+  return applyBuiltText(tools);
+}
+
+/**
+ * A read-only tool may be a COPY of a tool whose file sits under another level
+ * (same name, schema and handler — e.g. a pure read kept under `high/`). The
+ * file walk files it under that level only, so the built read-only group is
+ * asked which names it serves, and each one the walk did not place under
+ * `readonly` is documented there as well.
+ */
+function readOnlyCopies(tools) {
+  const distEntry = path.join(
+    __dirname,
+    '..',
+    'dist',
+    'lib',
+    'handlers',
+    'groups',
+    'ReadOnlyHandlersGroup.js',
+  );
+  requireFreshBuild(distEntry);
+  const { ReadOnlyHandlersGroup } = require(distEntry);
+  const names = new ReadOnlyHandlersGroup({ connection: null })
+    .getHandlers()
+    .map((entry) => entry.toolDefinition.name);
+  const placed = new Set(
+    tools.filter((t) => t.level === 'readonly').map((t) => t.name),
+  );
+  const copies = [];
+  for (const name of names) {
+    if (placed.has(name)) continue;
+    const source = tools.find((t) => t.name === name);
+    if (source) copies.push({ ...source, level: 'readonly' });
+  }
+  return copies;
+}
+
+function levelTitle(level) {
+  if (level === 'readonly') return 'Read-Only';
+  if (level === 'high') return 'High-Level';
+  if (level === 'low') return 'Low-Level';
+  if (level === 'debug') return 'Debug';
+  return level;
+}
+
+function groupByLevelAndObject(tools) {
+  const grouped = {};
+  for (const level of LEVELS) grouped[level] = {};
+
+  for (const tool of tools) {
+    if (!grouped[tool.level][tool.objectFolder]) {
+      grouped[tool.level][tool.objectFolder] = {
+        objectTitle: tool.objectTitle,
+        tools: [],
+      };
+    }
+    grouped[tool.level][tool.objectFolder].tools.push(tool);
+  }
+
+  return grouped;
+}
+
+function renderParams(tool) {
+  const props = tool.inputSchema?.properties || {};
+  const keys = Object.keys(props);
+  if (keys.length === 0) {
+    if (tool.inputSchemaRef) {
+      return `- See schema reference \`${tool.inputSchemaRef}\` in source file\n`;
+    }
+    return '- None\n';
+  }
+
+  const required = new Set(tool.inputSchema?.required || []);
+  let out = '';
+  for (const key of keys.sort((a, b) => a.localeCompare(b))) {
+    const p = props[key];
+    const req = required.has(key) ? 'required' : 'optional';
+    const def = p.default !== undefined ? ` (default: ${p.default})` : '';
+    out += `- \`${key}\` (${p.type}, ${req}${def}) - ${p.description}\n`;
+  }
+  return out;
+}
+
+function generateMarkdown(tools) {
+  const grouped = groupByLevelAndObject(tools);
+  const summary = {
+    total: tools.length,
+    readonly: tools.filter((t) => t.level === 'readonly').length,
+    high: tools.filter((t) => t.level === 'high').length,
+    low: tools.filter((t) => t.level === 'low').length,
+    debug: tools.filter((t) => t.level === 'debug').length,
+  };
+
+  let md = `# Available Tools Reference - MCP ABAP ADT Server\n\n`;
+  md += `Generated from code in \`src/handlers/**\` (not from docs).\n\n`;
+  md += `## Summary\n\n`;
+  md += `- Total tools: ${summary.total}\n`;
+  md += `- Read-only tools: ${summary.readonly}\n`;
+  md += `- High-level tools: ${summary.high}\n`;
+  md += `- Low-level tools: ${summary.low}\n`;
+  md += `- Debug tools: ${summary.debug}\n\n`;
+
+  md += `## Handler Sets\n\n`;
+  md += `- \`readonly\` -> [Read-Only Group](#read-only-group)\n`;
+  md += `- \`high\` -> [High-Level Group](#high-level-group)\n`;
+  md += `- \`low\` -> [Low-Level Group](#low-level-group)\n`;
+  md += `- \`debug\` (opt-in) -> [Debug Group](#debug-group)\n`;
+  md += `- \`compact\` -> [High-Level / Compact](#high-level-compact)\n\n`;
+
+  md += `## Navigation\n\n`;
+  md += `- [Compact Set](#high-level-compact)\n`;
+  for (const level of LEVELS) {
+    const objects = Object.values(grouped[level]).sort((a, b) =>
+      a.objectTitle.localeCompare(b.objectTitle),
+    );
+    if (objects.length === 0) continue;
+
+    const levelHeading = `${levelTitle(level)} Group`;
+    const levelAnchor = anchorFromHeading(levelHeading);
+    md += `- [${levelTitle(level)} Group](#${levelAnchor})\n`;
+    for (const obj of objects) {
+      const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+      const objAnchor = anchorFromHeading(objectHeading);
+      md += `  - [${obj.objectTitle}](#${objAnchor})\n`;
+      for (const tool of obj.tools) {
+        const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+        const toolAnchor = anchorFromHeading(toolHeading);
+        md += `    - [${tool.name}](#${toolAnchor})\n`;
+      }
+    }
+  }
+
+  md += `\n---\n\n`;
+
+  for (const level of LEVELS) {
+    const objects = Object.values(grouped[level]).sort((a, b) =>
+      a.objectTitle.localeCompare(b.objectTitle),
+    );
+    if (objects.length === 0) continue;
+
+    const levelHeading = `${levelTitle(level)} Group`;
+    const levelAnchor = anchorFromHeading(levelHeading);
+    md += `<a id="${levelAnchor}"></a>\n`;
+    md += `## ${levelHeading}\n\n`;
+
+    for (const obj of objects) {
+      const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+      const objectAnchor = anchorFromHeading(objectHeading);
+      md += `<a id="${objectAnchor}"></a>\n`;
+      md += `### ${objectHeading}\n\n`;
+
+      for (const tool of obj.tools) {
+        const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+        const toolAnchor = anchorFromHeading(toolHeading);
+        md += `<a id="${toolAnchor}"></a>\n`;
+        md += `#### ${toolHeading}\n`;
+        md += `**Description:** ${tool.description || 'No description'}\n\n`;
+        md += `**Source:** \`${tool.filePath}\`\n\n`;
+        md += `**Parameters:**\n`;
+        md += renderParams(tool);
+        md += `\n---\n\n`;
+      }
+    }
+  }
+
+  md += `*Last updated: ${new Date().toISOString().slice(0, 10)}*\n`;
+  return md;
+}
+
+function generateLevelMarkdown(tools, level) {
+  const levelTools = tools.filter((t) => t.level === level);
+  const grouped = groupByLevelAndObject(levelTools);
+  const objects = Object.values(grouped[level]).sort((a, b) =>
+    a.objectTitle.localeCompare(b.objectTitle),
+  );
+
+  let md = `# ${levelTitle(level)} Tools - MCP ABAP ADT Server\n\n`;
+  md += `Generated from code in \`src/handlers/**\` (not from docs).\n\n`;
+  md += `- Level: ${levelTitle(level)}\n`;
+  md += `- Total tools: ${levelTools.length}\n\n`;
+
+  md += `## Navigation\n\n`;
+  const levelHeading = `${levelTitle(level)} Group`;
+  md += `- [${levelHeading}](#${anchorFromHeading(levelHeading)})\n`;
+  for (const obj of objects) {
+    const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+    md += `  - [${obj.objectTitle}](#${anchorFromHeading(objectHeading)})\n`;
+    for (const tool of obj.tools) {
+      const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+      md += `    - [${tool.name}](#${anchorFromHeading(toolHeading)})\n`;
+    }
+  }
+
+  md += `\n---\n\n`;
+  md += `<a id="${anchorFromHeading(levelHeading)}"></a>\n`;
+  md += `## ${levelHeading}\n\n`;
+
+  for (const obj of objects) {
+    const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+    md += `<a id="${anchorFromHeading(objectHeading)}"></a>\n`;
+    md += `### ${objectHeading}\n\n`;
+
+    for (const tool of obj.tools) {
+      const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+      md += `<a id="${anchorFromHeading(toolHeading)}"></a>\n`;
+      md += `#### ${toolHeading}\n`;
+      md += `**Description:** ${tool.description || 'No description'}\n\n`;
+      md += `**Source:** \`${tool.filePath}\`\n\n`;
+      md += `**Parameters:**\n`;
+      md += renderParams(tool);
+      md += `\n---\n\n`;
+    }
+  }
+
+  md += `*Last updated: ${new Date().toISOString().slice(0, 10)}*\n`;
+  return md;
+}
+
+function generateEnvironmentMarkdown(tools, envName, envLabel, envDescription) {
+  const envTools = tools.filter(
+    (t) => t.availableIn && t.availableIn.includes(envName),
+  );
+  const grouped = groupByLevelAndObject(envTools);
+
+  let md = `# ${envLabel} Tools - MCP ABAP ADT Server\n\n`;
+  md += `Generated from code in \`src/handlers/**\` (not from docs).\n\n`;
+  md += `${envDescription}\n\n`;
+  md += `- Total tools: ${envTools.length}\n`;
+  for (const level of LEVELS) {
+    const count = envTools.filter((t) => t.level === level).length;
+    if (count > 0) md += `- ${levelTitle(level)}: ${count}\n`;
+  }
+  md += `\n`;
+
+  md += `## Navigation\n\n`;
+  for (const level of LEVELS) {
+    const objects = Object.values(grouped[level]).sort((a, b) =>
+      a.objectTitle.localeCompare(b.objectTitle),
+    );
+    if (objects.length === 0) continue;
+
+    const levelHeading = `${levelTitle(level)} Group`;
+    md += `- [${levelTitle(level)} Group](#${anchorFromHeading(levelHeading)})\n`;
+    for (const obj of objects) {
+      const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+      md += `  - [${obj.objectTitle}](#${anchorFromHeading(objectHeading)})\n`;
+      for (const tool of obj.tools) {
+        const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+        md += `    - [${tool.name}](#${anchorFromHeading(toolHeading)})\n`;
+      }
+    }
+  }
+
+  md += `\n---\n\n`;
+
+  for (const level of LEVELS) {
+    const objects = Object.values(grouped[level]).sort((a, b) =>
+      a.objectTitle.localeCompare(b.objectTitle),
+    );
+    if (objects.length === 0) continue;
+
+    const levelHeading = `${levelTitle(level)} Group`;
+    md += `<a id="${anchorFromHeading(levelHeading)}"></a>\n`;
+    md += `## ${levelHeading}\n\n`;
+
+    for (const obj of objects) {
+      const objectHeading = `${levelTitle(level)} / ${obj.objectTitle}`;
+      md += `<a id="${anchorFromHeading(objectHeading)}"></a>\n`;
+      md += `### ${objectHeading}\n\n`;
+
+      for (const tool of obj.tools) {
+        const toolHeading = `${tool.name} (${levelTitle(level)} / ${obj.objectTitle})`;
+        md += `<a id="${anchorFromHeading(toolHeading)}"></a>\n`;
+        md += `#### ${toolHeading}\n`;
+        md += `**Description:** ${tool.description || 'No description'}\n\n`;
+        md += `**Source:** \`${tool.filePath}\`\n\n`;
+        md += `**Available in:** \`${tool.availableIn.join('`, `')}\`\n\n`;
+        md += `**Parameters:**\n`;
+        md += renderParams(tool);
+        md += `\n---\n\n`;
+      }
+    }
+  }
+
+  md += `*Last updated: ${new Date().toISOString().slice(0, 10)}*\n`;
+  return md;
+}
+
+function main() {
+  console.log('🔍 Scanning handler code in src/handlers...');
+  const tools = loadToolsFromHandlers();
+
+  if (tools.length === 0) {
+    console.error('❌ No TOOL_DEFINITION found in src/handlers');
+    process.exit(1);
+  }
+
+  console.log(`✅ Found ${tools.length} tools`);
+  const markdownAll = generateMarkdown(tools);
+  fs.writeFileSync(OUTPUT_PATHS.all, markdownAll, 'utf8');
+  fs.writeFileSync(
+    OUTPUT_PATHS.readonly,
+    generateLevelMarkdown(tools, 'readonly'),
+    'utf8',
+  );
+  fs.writeFileSync(
+    OUTPUT_PATHS.high,
+    generateLevelMarkdown(tools, 'high'),
+    'utf8',
+  );
+  fs.writeFileSync(
+    OUTPUT_PATHS.low,
+    generateLevelMarkdown(tools, 'low'),
+    'utf8',
+  );
+  // The legacy page writes itself back when there is something to put on it.
+  //
+  // Support for legacy systems (BASIS < 7.50) is parked on
+  // `parked/legacy-support` until it can be tried against a live system, and
+  // no tool declares that environment today — so this would otherwise
+  // generate a page listing nothing. Deleting the branch instead would mean
+  // the page had to be reconstructed by hand when legacy comes back, which
+  // is the one cost worth avoiding here: the text is generated, the code that
+  // generates it is what would have been lost.
+  const declaresLegacy = tools.some((tool) =>
+    (tool.availableIn || []).includes('legacy'),
+  );
+  if (declaresLegacy) {
+    fs.writeFileSync(
+      OUTPUT_PATHS.legacy,
+      generateEnvironmentMarkdown(
+        tools,
+        'legacy',
+        'Legacy System',
+        'Tools available on legacy SAP systems (BASIS < 7.50).',
+      ),
+      'utf8',
+    );
+  }
+
+  console.log(`✅ Documentation generated: ${OUTPUT_PATHS.all}`);
+  console.log(`✅ Documentation generated: ${OUTPUT_PATHS.readonly}`);
+  console.log(`✅ Documentation generated: ${OUTPUT_PATHS.high}`);
+  console.log(`✅ Documentation generated: ${OUTPUT_PATHS.low}`);
+  console.log(
+    declaresLegacy
+      ? `✅ Documentation generated: ${OUTPUT_PATHS.legacy}`
+      : 'ℹ️  Skipped AVAILABLE_TOOLS_LEGACY.md — no tool declares legacy',
+  );
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`\u274c  ${error.message}`);
+    process.exit(1);
+  }
+}
+
+module.exports = {
+  extractToolDefinition,
+  loadToolsFromHandlers,
+  parseTopLevelProperties,
+  generateMarkdown,
+  generateLevelMarkdown,
+};

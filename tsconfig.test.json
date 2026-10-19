@@ -1,0 +1,51 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "jest"],
+    // The emitting tsconfig.json pins `rootDir` to `./src`, which is correct
+    // for `dist/` but refuses any file under `scripts/` the moment this
+    // config's `include` reaches there (TS6059). This config never emits —
+    // ts-jest transpiles per-file and `tsc --noEmit -p` here is a checker
+    // run, not a build — so widening `rootDir` to the repo root costs
+    // nothing and lets the audit tooling under `scripts/` type-check with
+    // the tests.
+    //
+    // Only the audit tooling, not all of `scripts/`. The other scripts carry
+    // eighteen errors of their own that predate this migration, and adopting
+    // them here would make "errors naming the files this task touched" — the
+    // measure every remaining task reports against — noisier for no gain.
+    "rootDir": ".",
+    // The compact facade lives in sibling packages now, and the tests that
+    // exercise it import them by package name. ts-jest resolves those names
+    // through these paths, the jest runtime through `moduleNameMapper` in
+    // package.json — the two lists have to agree, which is what
+    // `packageEntryPoints`-style drift would otherwise hide.
+    "paths": {
+      "@mcp-abap-adt/lib": ["./src/index.ts"],
+      "@mcp-abap-adt/lib/handlers": ["./src/lib/handlers/index.ts"],
+      "@mcp-abap-adt/lib/handlers/read": ["./src/lib/handlers/read.ts"],
+      "@mcp-abap-adt/lib/handlers/write": ["./src/lib/handlers/write.ts"],
+      "@mcp-abap-adt/lib/compact-shared": ["./src/lib/compact/index.ts"],
+      "@mcp-abap-adt/lib/debugger": ["./src/lib/debugger/index.ts"],
+      "@mcp-abap-adt/lib/state": ["./src/lib/state/index.ts"],
+      "@mcp-abap-adt/lib/utils": ["./src/lib/utils.ts"],
+      "@mcp-abap-adt/lib/config": ["./src/lib/config/index.ts"],
+      "@mcp-abap-adt/compact-readonly": ["./compact-readonly/src/index.ts"],
+      "@mcp-abap-adt/compact-readonly/routes": ["./compact-readonly/src/handlers/compactReadRoutes.ts"],
+      "@mcp-abap-adt/compact-modify": ["./compact-modify/src/index.ts"],
+      "@mcp-abap-adt/compact-modify/routes": ["./compact-modify/src/handlers/compactWriteRoutes.ts"],
+      "@mcp-abap-adt/core/launcher": ["./server/src/launcher.ts"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "compact-readonly/src/**/*",
+    "compact-modify/src/**/*",
+    "compact/src/**/*",
+    "src/__tests__/**/*",
+    "src/lib/servers/v2/__tests__/**/*",
+    "scripts/lib/**/*",
+    "scripts/check-analyse.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,44 @@
+{
+  "xsappname": "abap-mcp-server",
+  "tenant-mode": "dedicated",
+  "description": "MCP ABAP ADT server on SAP BTP: who may call the MCP endpoint",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.MCPUser",
+      "description": "Call the MCP ABAP ADT server"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "MCPUser",
+      "description": "Use the MCP ABAP ADT server",
+      "scope-references": ["$XSAPPNAME.MCPUser"]
+    }
+  ],
+  "role-collections": [
+    {
+      "name": "ABAP_MCP_User",
+      "description": "Use the MCP ABAP ADT server",
+      "role-template-references": ["$XSAPPNAME.MCPUser"]
+    }
+  ],
+  "authorities": ["$XSAPPNAME.MCPUser"],
+  "authorities-inheritance": false,
+  "oauth2-configuration": {
+    "token-validity": 3600,
+    "refresh-token-validity": 86400,
+    "grant-types": [
+      "authorization_code",
+      "refresh_token",
+      "client_credentials",
+      "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    ],
+    "redirect-uris": [
+      "http://localhost:*/**",
+      "http://127.0.0.1:*/**",
+      "https://claude.ai/api/mcp/auth_callback",
+      "https://vscode.dev/redirect",
+      "https://*.cfapps.ca10.hana.ondemand.com/**"
+    ]
+  }
+}

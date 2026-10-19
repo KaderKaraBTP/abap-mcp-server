@@ -1,0 +1,76 @@
+/**
+ * DeleteServiceDefinition Handler - Delete ABAP ServiceDefinition via ADT
+ * deletion API
+ *
+ * Uses AdtClient.getServiceDefinition().delete from
+ * @mcp-abap-adt/adt-clients 19. See `handleDeleteDomain.ts` for the shape and
+ * the masking this follows: a refusal answers 200, `analyseDeletion` reads
+ * it rather than the status, and no lock is taken because a held lock is
+ * what makes ADT refuse.
+ */
+
+import { serviceDefinitionDocuments } from '@mcp-abap-adt/adt-clients';
+import { answer } from '../../../lib/answer';
+import { createAdtClient } from '../../../lib/clients';
+import type { HandlerContext } from '../../../lib/handlers/interfaces';
+import { deleteIfDeletable } from '../../../lib/strategies/checkedDeletion';
+import { DETAIL_PROPERTY, detailOf } from '../../../lib/strategies/detail';
+import { project, terseDeletion } from '../../../lib/strategies/projections';
+import { resultsFor } from '../../../lib/strategies/resultSets';
+import { return_error } from '../../../lib/utils';
+
+export const TOOL_DEFINITION = {
+  name: 'DeleteServiceDefinition',
+  available_in: ['onprem', 'cloud'] as const,
+  description:
+    'Delete an ABAP service definition from the SAP system via ADT deletion API. Transport request optional for local objects.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      service_definition_name: {
+        type: 'string',
+        description: 'ServiceDefinition name.',
+      },
+      transport_request: {
+        type: 'string',
+        description:
+          'Transport request number, not a task. Required for transportable objects. Optional for local objects.',
+      },
+      ...DETAIL_PROPERTY,
+    },
+    required: ['service_definition_name'],
+  },
+} as const;
+
+interface DeleteServiceDefinitionArgs {
+  service_definition_name: string;
+  transport_request?: string;
+  detail?: 'terse' | 'full' | 'raw';
+}
+
+export async function handleDeleteServiceDefinition(
+  context: HandlerContext,
+  args: DeleteServiceDefinitionArgs,
+) {
+  const { connection, logger } = context;
+  const { service_definition_name, transport_request } = args;
+
+  if (!service_definition_name) {
+    return return_error(new Error('service_definition_name is required'));
+  }
+
+  const serviceDefinitionName = service_definition_name.toUpperCase();
+  const detail = detailOf(args);
+
+  return answer(
+    { tool: 'DeleteServiceDefinition', detail },
+    () =>
+      deleteIfDeletable(
+        createAdtClient(connection, logger).getServiceDefinition(
+          resultsFor(serviceDefinitionDocuments),
+        ),
+        { serviceDefinitionName, transportRequest: transport_request },
+      ),
+    project(detail, terseDeletion),
+  );
+}

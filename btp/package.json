@@ -1,0 +1,30 @@
+{
+  "name": "abap-mcp-server-btp",
+  "version": "18.1.0",
+  "private": true,
+  "description": "The MCP ABAP ADT server as a SAP BTP Cloud Foundry application: streamable HTTP behind XSUAA, SAP systems as BTP destinations (Cloud Connector for on premise).",
+  "license": "AGPL-3.0-only",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "node scripts/build.mjs",
+    "build:ts": "tsc -p tsconfig.json"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "@mcp-abap-adt/core": "file:vendor/core.tgz",
+    "@mcp-abap-adt/lib": "file:vendor/lib.tgz",
+    "@sap/xssec": "^4.15.0",
+    "axios": "^1.20.0",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@mcp-abap-adt/connection": "^11.0.0",
+    "@mcp-abap-adt/interfaces-auth": "^3.2.0",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.20.5",
+    "typescript": "^6.0.2"
+  }
+}
