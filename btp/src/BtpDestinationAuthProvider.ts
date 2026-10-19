@@ -145,7 +145,35 @@ export class BtpDestinationAuthProvider implements IAuthProvider {
    * A refused request drops what is held — the destination (its password may
    * have changed) and the proxy tokens — and buys one more attempt.
    */
-  async rejected(_rejection: IAuthRejection): Promise<AuthOutcome> {
+  async rejected(rejection: IAuthRejection): Promise<AuthOutcome> {
+    // Who refused — SAP, the Cloud Connector or the connectivity proxy — is
+    // only visible in the answer's headers; the server logs no message of its
+    // own. Headers named here carry no credential.
+    const response = (
+      rejection.error as {
+        response?: { headers?: Record<string, unknown>; data?: unknown };
+      }
+    )?.response;
+    const said: Record<string, unknown> = {};
+    for (const name of [
+      'server',
+      'www-authenticate',
+      'proxy-authenticate',
+      'sap-server',
+      'sap-system',
+      'x-sap-error',
+      'content-type',
+    ]) {
+      const value = response?.headers?.[name];
+      if (value !== undefined) said[name] = value;
+    }
+    const body =
+      typeof response?.data === 'string'
+        ? response.data.replace(/\s+/g, ' ').slice(0, 300)
+        : '';
+    console.error(
+      `[BTP] destination "${this.name}": ${rejection.at} refused (${rejection.status ?? '?'}) ${JSON.stringify(said)} ${body}`,
+    );
     this.destinations.forget(this.name);
     if (this.connectivity) forgetTokens(this.connectivity);
     if (this.retried) {
