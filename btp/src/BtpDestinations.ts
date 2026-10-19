@@ -14,7 +14,10 @@
 
 import type { SapConfig } from '@mcp-abap-adt/connection';
 import type { IAuthProvider } from '@mcp-abap-adt/interfaces-auth';
-import type { IDestinations } from '@mcp-abap-adt/lib/auth';
+import type {
+  DestinationSystemContext,
+  IDestinations,
+} from '@mcp-abap-adt/lib/auth';
 import type { HttpProxy } from '@mcp-abap-adt/lib/utils';
 import { BtpDestinationAuthProvider } from './BtpDestinationAuthProvider';
 import type { DestinationService } from './destinationService';
@@ -79,6 +82,37 @@ export class BtpDestinations implements IDestinations {
       this.service,
       this.connectivity,
     );
+  }
+
+  /**
+   * What the destination states about who answers for a change: the
+   * additional properties `SAP_RESPONSIBLE` and `SAP_MASTER_SYSTEM`, and the
+   * logon user of a `BasicAuthentication` destination. The server takes the
+   * login as the responsible only when no responsible is stated anywhere
+   * (tool argument, `x-sap-responsible`, this property, the process).
+   * SAP user names are upper case, so these are too.
+   */
+  async systemContextFor(
+    destination: string,
+  ): Promise<DestinationSystemContext> {
+    this.assertAllowed(destination);
+    const { configuration } = await this.service.find(
+      destination,
+      currentUser().userJwt,
+    );
+    const upper = (value: string | undefined) =>
+      value?.trim() ? value.trim().toUpperCase() : undefined;
+    const context: DestinationSystemContext = {};
+    const responsible = upper(configuration.SAP_RESPONSIBLE);
+    const masterSystem = upper(configuration.SAP_MASTER_SYSTEM);
+    const login =
+      configuration.Authentication === 'BasicAuthentication'
+        ? upper(configuration.User)
+        : undefined;
+    if (responsible) context.responsible = responsible;
+    if (masterSystem) context.masterSystem = masterSystem;
+    if (login) context.login = login;
+    return context;
   }
 
   /** The connectivity proxy for an on-premise destination's URL; none otherwise. */
