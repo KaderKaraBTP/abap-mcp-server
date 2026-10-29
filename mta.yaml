@@ -27,16 +27,17 @@ modules:
         - package-lock.json
     parameters:
       buildpack: nodejs_buildpack
-      memory: 1024M
+      # Idles around 50M; 512M leaves a trial org room to stage an update.
+      memory: 512M
       disk-quota: 1024M
       command: node dist/index.js
       health-check-type: http
       health-check-http-endpoint: /mcp/health
-      # Route: https://<org>-<space>-abap-mcp-server.cfapps.ca10.hana.ondemand.com
+      # Route: https://<org>-<space>-abap-mcp-server.cfapps.us10-001.hana.ondemand.com
     properties:
       NODE_ENV: production
       # The BTP destination used when a request names none. Change to yours.
-      SAP_DESTINATION: S4H_ADT
+      SAP_DESTINATION: ECC_NPL
       # Let a client pick another destination with the x-mcp-destination header.
       MCP_ALLOW_DESTINATION_HEADER: "true"
       # Optional allowlist of destination names (comma-separated); empty = any.

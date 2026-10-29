@@ -38,7 +38,8 @@
       "http://127.0.0.1:*/**",
       "https://claude.ai/api/mcp/auth_callback",
       "https://vscode.dev/redirect",
-      "https://*.cfapps.ca10.hana.ondemand.com/**"
+      "https://*.cfapps.ca10.hana.ondemand.com/**",
+      "https://*.cfapps.us10-001.hana.ondemand.com/**"
     ]
   }
 }

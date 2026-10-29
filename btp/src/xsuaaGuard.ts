@@ -82,7 +82,10 @@ export function protectedResourceMetadata(
 ) {
   return {
     resource,
-    authorization_servers: [credentials.url],
+    // XSUAA's metadata names `<url>/oauth/token` as its issuer, and an RFC 8414
+    // client (the MCP SDK, mcp-remote) refuses a server whose issuer differs
+    // from the URL it was given: the bare `url` fails discovery.
+    authorization_servers: [`${credentials.url.replace(/\/+$/, '')}/oauth/token`],
     bearer_methods_supported: ['header'],
     scopes_supported: [`${credentials.xsappname}.${scope}`],
     resource_name: 'SAP ABAP ADT MCP server',

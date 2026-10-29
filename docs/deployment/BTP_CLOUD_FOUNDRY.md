@@ -138,6 +138,41 @@ claude mcp add --transport http abap https://<route>/mcp \
   --header "x-mcp-destination: S4H_ADT"
 ```
 
+Claude Desktop (`claude_desktop_config.json`) starts only local servers, so it
+reaches the route through `mcp-remote`. XSUAA has no dynamic client
+registration: give it the `clientid`/`clientsecret` of a service key in a file,
+and it runs the authorization code flow in the browser and refreshes the token.
+Its callback, `http://localhost:3334/oauth/callback`, is covered by the
+`http://localhost:*/**` redirect URI.
+
+```powershell
+cf create-service-key abap-mcp-xsuaa claude-desktop
+$guid = (cf service-key abap-mcp-xsuaa claude-desktop --guid).Trim()
+$k = (cf curl "/v3/service_credential_bindings/$guid/details" | Out-String | ConvertFrom-Json).credentials
+New-Item -ItemType Directory -Force "$HOME\.mcp-auth" | Out-Null
+[IO.File]::WriteAllText("$HOME\.mcp-authbap-client.json",
+  (@{ client_id = $k.clientid; client_secret = $k.clientsecret } | ConvertTo-Json -Compress))
+```
+
+```json
+{
+  "mcpServers": {
+    "abap": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote@0.15.2", "https://<route>/mcp", "3334",
+        "--header", "x-mcp-destination:<destination>",
+        "--static-oauth-client-info", "@C:\Users\<you>\.mcp-auth\abap-client.json"
+      ]
+    }
+  }
+}
+```
+
+Write the header without a space after the colon: on Windows `npx` splits an
+argument at a space. The user who logs on needs the `ABAP_MCP_User` role
+collection.
+
 Generic `mcp.json` (Cline, Cursor, VS Code):
 
 ```json
@@ -195,5 +230,9 @@ After changing a property, redeploy, or run `cf set-env abap-mcp-server
 | `cf logs abap-mcp-server --recent` shows `No Destination service is bound` | Resource not created. Check `cf services` |
 | `BTP destination "…" was not found` | Name mismatch, or the destination is in another subaccount |
 | `503`/`502` from the proxy, or `Connection refused` | Cloud Connector not connected, wrong virtual host or port, Location ID mismatch, or the resource path is not exposed |
+| `503` *There is no SAP Cloud Connector (SCC) connected to your subaccount matching the requested tunnel … and SCC location ID "…"* | The destination's Location ID differs from the connector's. The connector's tunnel id ends in its location (`account:///<subaccount>/<location>` in `ljs_trace.log`); copy it exactly, or leave both empty |
+| `initialize … FAILED: AxiosError` in the app log, nothing else | The ADT request failed below the connector's logging. Repeat it from the container (`cf enable-ssh`, restart, `cf ssh`) with the destination's URL, the Connectivity token as `Proxy-Authorization` and the proxy from `VCAP_SERVICES`; the proxy's body names the cause |
+| Client: `IssuerMismatchError … expected "https://<subdomain>.authentication…", received "…/oauth/token"` | The protected resource metadata named XSUAA's bare URL. It names `<url>/oauth/token`, the issuer XSUAA states; redeploy a build that has it |
+| `organization's memory limit exceeded: staging requires …` on restage | Staging needs the app's memory a second time. Lower `memory`, or apply an env change with `cf restart` (no staging) |
 | `403` from SAP on `/sap/bc/adt/...` | The SAP user lacks ADT authorization (`S_ADT_RES`, `S_DEVELOP`) |
 | `401` from the app | The token is missing or expired, or has no `MCPUser` scope. Assign `ABAP_MCP_User`, or check the service key's client |
